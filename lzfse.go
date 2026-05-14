@@ -403,16 +403,24 @@ func decodeCompressedBlock(h v1Header, payload []byte) ([]byte, error) {
 
 	// --- Build FSE tables ---
 	litTable := make([]fseDecoderEntry, literalStates)
-	fseInitDecoderTable(h.literalFreq[:], literalStates, litTable)
+	if err := fseInitDecoderTable(h.literalFreq[:], literalStates, litTable); err != nil {
+		return nil, err
+	}
 
 	lValueTable := make([]fseValueDecoderEntry, lStates)
-	fseInitValueDecoderTable(h.lFreq[:], lStates, lExtraBits[:], lBaseValue[:], lValueTable)
+	if err := fseInitValueDecoderTable(h.lFreq[:], lStates, lExtraBits[:], lBaseValue[:], lValueTable); err != nil {
+		return nil, err
+	}
 
 	mValueTable := make([]fseValueDecoderEntry, mStates)
-	fseInitValueDecoderTable(h.mFreq[:], mStates, mExtraBits[:], mBaseValue[:], mValueTable)
+	if err := fseInitValueDecoderTable(h.mFreq[:], mStates, mExtraBits[:], mBaseValue[:], mValueTable); err != nil {
+		return nil, err
+	}
 
 	dValueTable := make([]fseValueDecoderEntry, dStates)
-	fseInitValueDecoderTable(h.dFreq[:], dStates, dExtraBits[:], dBaseValue[:], dValueTable)
+	if err := fseInitValueDecoderTable(h.dFreq[:], dStates, dExtraBits[:], dBaseValue[:], dValueTable); err != nil {
+		return nil, err
+	}
 
 	// --- Decode literals (4 interleaved streams) ---
 	literals := make([]byte, nLiterals)
@@ -490,13 +498,18 @@ func decodeCompressedBlock(h v1Header, payload []byte) ([]byte, error) {
 			out = append(out, literals[litPos:end]...)
 			litPos = end
 
-			// Copy M bytes from earlier in output
-			if D <= 0 || int(D) > len(out) {
-				return nil, errors.New("lzfse: invalid match distance")
-			}
-			matchStart := len(out) - int(D)
-			for k := int32(0); k < M; k++ {
-				out = append(out, out[matchStart+int(k)])
+			// Copy M bytes from earlier in output. M == 0 happens for
+			// the synthetic prefix records the encoder emits when a
+			// literal run exceeds maxLValue; the D value is logically
+			// irrelevant in that case so skip the distance check.
+			if M > 0 {
+				if D <= 0 || int(D) > len(out) {
+					return nil, errors.New("lzfse: invalid match distance")
+				}
+				matchStart := len(out) - int(D)
+				for k := int32(0); k < M; k++ {
+					out = append(out, out[matchStart+int(k)])
+				}
 			}
 		}
 
@@ -730,7 +743,14 @@ func findMatches(src []byte) []match {
 				})
 				litStart = pending.pos + pending.M
 				pending.pos = noPending
-				pending = pendingMatch{pos: i, lit: litStart, M: bestM, D: bestD}
+				// Only seed a new pending when i is past the just-
+				// emitted match. Otherwise the new pending would
+				// overlap the previous match's coverage and the
+				// downstream encodeBlock would slice src[litPos:m.pos]
+				// with litPos > m.pos.
+				if i >= litStart {
+					pending = pendingMatch{pos: i, lit: litStart, M: bestM, D: bestD}
+				}
 			}
 		}
 
@@ -776,28 +796,52 @@ const (
 func encodeBlock(src []byte, srcStart, srcEnd int, blockMatches []match) ([]byte, error) {
 	// Separate literals and LMD triples
 	literals := make([]byte, 0, literalsPerBlock)
-	lValues := make([]int, 0, matchesPerBlock)
-	mValues := make([]int, 0, matchesPerBlock)
-	dValues := make([]int, 0, matchesPerBlock)
+	// Build raw triples first; apply the D-reuse transform AFTER
+	// splitting long literal runs so the split-prefix records inherit
+	// the right D value.
+	rawL := make([]int, 0, matchesPerBlock)
+	rawM := make([]int, 0, matchesPerBlock)
+	rawD := make([]int, 0, matchesPerBlock)
 
 	litPos := srcStart
-	var lastD int
 	for _, m := range blockMatches {
-		// Literal bytes
 		literals = append(literals, src[litPos:m.pos]...)
-		lValues = append(lValues, m.L)
-		mValues = append(mValues, m.M)
-		if m.D == lastD {
-			dValues = append(dValues, 0) // reuse previous D
-		} else {
-			dValues = append(dValues, m.D)
-			lastD = m.D
+		// Split long literal runs (L > maxLValue=315) into one or more
+		// prefix records carrying (L=maxLValue, M=0, D=match's D)
+		// followed by the actual (residualL, M, D) record. The M=0
+		// prefix records are no-ops at decode time but keep each L in
+		// the FSE symbol-table range.
+		L := m.L
+		for L > maxLValue {
+			rawL = append(rawL, maxLValue)
+			rawM = append(rawM, 0)
+			rawD = append(rawD, m.D)
+			L -= maxLValue
 		}
+		rawL = append(rawL, L)
+		rawM = append(rawM, m.M)
+		rawD = append(rawD, m.D)
 		litPos = m.pos + m.M
 	}
 	// Trailing literals have no match; they're stored in the literals buffer
 	// but not associated with any match — the decoder just appends them after.
 	literals = append(literals, src[litPos:srcEnd]...)
+
+	// Apply the D-reuse transform: emit 0 when D matches lastD.
+	lValues := rawL
+	mValues := rawM
+	dValues := make([]int, len(rawD))
+	{
+		var lastD int
+		for i, d := range rawD {
+			if d == lastD {
+				dValues[i] = 0
+			} else {
+				dValues[i] = d
+				lastD = d
+			}
+		}
+	}
 
 	nLiterals := len(literals)
 	nMatches := len(lValues)

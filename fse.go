@@ -283,7 +283,7 @@ func fseNormalizeFreq(counts []int, nstates int) ([]uint16, error) {
 // FSE decoder table init (port of fse_init_decoder_table)
 // ---------------------------------------------------------------------------
 
-func fseInitDecoderTable(freqs []uint16, nstates int, table []fseDecoderEntry) {
+func fseInitDecoderTable(freqs []uint16, nstates int, table []fseDecoderEntry) error {
 	nClz := bits.LeadingZeros32(uint32(nstates))
 	offset := 0
 	for sym, f := range freqs {
@@ -291,6 +291,9 @@ func fseInitDecoderTable(freqs []uint16, nstates int, table []fseDecoderEntry) {
 			continue
 		}
 		fi := int(f)
+		if offset+fi > nstates {
+			return errors.New("lzfse: decoder freq table exceeds state space")
+		}
 		k := bits.LeadingZeros32(uint32(fi)) - nClz
 		j0 := (2 * nstates >> uint(k)) - fi
 		for j := 0; j < fi; j++ {
@@ -307,6 +310,7 @@ func fseInitDecoderTable(freqs []uint16, nstates int, table []fseDecoderEntry) {
 		}
 		offset += fi
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +319,7 @@ func fseInitDecoderTable(freqs []uint16, nstates int, table []fseDecoderEntry) {
 
 func fseInitValueDecoderTable(freqs []uint16, nstates int,
 	extraBits []uint8, baseValues []int32,
-	table []fseValueDecoderEntry) {
+	table []fseValueDecoderEntry) error {
 
 	nClz := bits.LeadingZeros32(uint32(nstates))
 	offset := 0
@@ -324,6 +328,9 @@ func fseInitValueDecoderTable(freqs []uint16, nstates int,
 			continue
 		}
 		fi := int(f)
+		if offset+fi > nstates {
+			return errors.New("lzfse: value decoder freq table exceeds state space")
+		}
 		k := bits.LeadingZeros32(uint32(fi)) - nClz
 		j0 := (2 * nstates >> uint(k)) - fi
 		vb := extraBits[sym]
@@ -347,6 +354,7 @@ func fseInitValueDecoderTable(freqs []uint16, nstates int,
 		}
 		offset += fi
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

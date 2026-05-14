@@ -1,7 +1,7 @@
 # lzfse
 
 [![ci](https://github.com/go-compressions/lzfse/actions/workflows/ci.yml/badge.svg)](https://github.com/go-compressions/lzfse/actions/workflows/ci.yml)
-![coverage](https://img.shields.io/badge/coverage-93.8%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-94.3%25-brightgreen)
 
 Pure-Go implementation of Apple's **LZFSE** and **LZVN** compression formats.
 Byte-compatible with the reference `liblzfse` C implementation: data compressed
@@ -10,7 +10,7 @@ is decoded by `liblzfse` without modification.
 
 ## Module
 
-```
+```text
 github.com/go-compressions/lzfse
 ```
 
@@ -71,15 +71,9 @@ patch and minor `gomod` updates auto-merge.
 
 ## Test coverage
 
-`task test` reports **93.8 % statement coverage** ([`cover.out`](cover.out)).
-The remaining ~6 % is split between:
-
-- Error-forwarding branches in `Decompress` that fire only on corrupted V1 /
-  V2 / freq-table bit-streams (panic-safety on adversarial input is a known
-  hardening gap — the random-garbage fuzz tests run with `recover()`).
-- One `findMatches` / `encodeBlock` branch reachable only when the encoder
-  generates overlapping matches for certain mixed-compressibility inputs
-  (separate known bug — `Compress` panics with `slice bounds out of range`
-  on payloads that alternate compressible runs with incompressible noise).
-
-Both gaps are tracked as future work.
+`task test` reports **94.3 % statement coverage** ([`cover.out`](cover.out)).
+The corruption / random-garbage fuzz suites assert no-panic, so the
+decoder is safe to call on adversarial input — bad data returns an
+error rather than crashing. The remaining ~6 % is rare error-forwarding
+branches that can be reached only by carefully hand-crafted V1 / V2 /
+freq-table fixtures.

@@ -63,6 +63,16 @@ func TestRoundtrip_LZFSE_Large(t *testing.T) {
 		{"random-incompressible-8KiB", pseudoRandom(8192, 42)},
 		{"random-incompressible-32KiB", pseudoRandom(32*1024, 7)},
 		{"large-128KiB", bytes.Repeat([]byte("large payload pattern "), 6000)[:128*1024]},
+		// Regression for the findMatches overlapping-matches bug:
+		// payloads alternating compressible and incompressible 1 KiB
+		// chunks used to panic in encodeBlock.
+		{"mixed-32KiB", mixedPayload(32 * 1024)},
+		// 60-byte run + replicated noise — used to crash via the
+		// "good match" pending-replacement path.
+		{"good-match-8KiB", goodMatchPayload(8192)},
+		// Two short / long competing matches near each other —
+		// stressed the "compare vs pending" branch.
+		{"pending-replace-8KiB", pendingReplacePayload(8192)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { roundtrip(t, tc.name, tc.data) })
@@ -424,23 +434,30 @@ func TestDecompress_RoundtripCorruption(t *testing.T) {
 				idx := 4 + r.Intn(len(buf)-4)
 				buf[idx] ^= byte(1 + r.Intn(255))
 			}
-			defer func() { _ = recover() }()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Decompress panicked on corrupted input: %v", r)
+				}
+			}()
 			_, _ = Decompress(buf)
 		})
 	}
 }
 
 // TestDecompress_RandomGarbage drives Decompress with pseudo-random
-// byte streams of varying lengths. Like the corruption test, panics
-// are swallowed — the goal is to exercise decode branches, not to
-// audit panic-safety of the FSE state machine.
+// byte streams of varying lengths and asserts no panic. Bad input
+// must return an error, not crash.
 func TestDecompress_RandomGarbage(t *testing.T) {
 	for _, n := range []int{16, 64, 256, 1024, 4096, 16384} {
 		for seed := int64(1); seed <= 8; seed++ {
 			name := intName("size", n) + "-" + intName("seed", int(seed))
 			t.Run(name, func(t *testing.T) {
 				buf := pseudoRandom(n, seed*17+int64(n))
-				defer func() { _ = recover() }()
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("Decompress panicked: %v", r)
+					}
+				}()
 				_, _ = Decompress(buf)
 			})
 		}
@@ -460,6 +477,59 @@ func TestCompress_Empty(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("empty roundtrip: got %d bytes, want 0", len(got))
 	}
+}
+
+// mixedPayload alternates 1 KiB of prose with 1 KiB of pseudo-random
+// noise. Used to fire the findMatches overlapping-matches path.
+func mixedPayload(n int) []byte {
+	out := make([]byte, 0, n)
+	prose := englishProse(n)
+	noise := pseudoRandom(n, 9)
+	chunk := 1024
+	flip := false
+	for len(out) < n {
+		x := chunk
+		if !flip {
+			off := len(out) % len(prose)
+			if off+x > len(prose) {
+				x = len(prose) - off
+			}
+			out = append(out, prose[off:off+x]...)
+		} else {
+			off := len(out) % len(noise)
+			if off+x > len(noise) {
+				x = len(noise) - off
+			}
+			out = append(out, noise[off:off+x]...)
+		}
+		flip = !flip
+	}
+	return out[:n]
+}
+
+// goodMatchPayload plants a 60-byte run twice so findMatches takes
+// its "bestM >= encodeGoodMatch (40)" emit-immediately branch.
+func goodMatchPayload(n int) []byte {
+	out := make([]byte, n)
+	copy(out, pseudoRandom(n, 17))
+	marker := bytes.Repeat([]byte{'G'}, 60)
+	copy(out[64:], marker)
+	copy(out[2048:], marker)
+	return out
+}
+
+// pendingReplacePayload plants competing short / long matches near
+// each other so findMatches enters the pending-replacement branch.
+func pendingReplacePayload(n int) []byte {
+	out := make([]byte, n)
+	copy(out, pseudoRandom(n, 19))
+	short := pseudoRandom(8, 23)
+	long := append(append([]byte(nil), short...), pseudoRandom(16, 25)...)
+	copy(out[64:], short)
+	copy(out[80:], long)
+	copy(out[1024:], short)
+	copy(out[1040:], long)
+	return out
 }
 
 // longDistancePayload returns n bytes with two identical 32-byte runs
