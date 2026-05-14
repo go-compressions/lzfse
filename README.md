@@ -74,6 +74,10 @@ This module is developed alongside other compression tooling in the
 and published to its own `github.com/go-compressions/lzfse`
 repository via the umbrella's [`publish.sh`](../publish.sh) helper.
 
+## License
+
+[BSD 3-Clause](LICENSE).
+
 ## Test coverage
 
 `task test` reports **100 % statement coverage** ([`cover.out`](cover.out)).
