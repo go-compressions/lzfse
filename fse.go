@@ -47,12 +47,10 @@ func (e fseDecoderEntry) delta() int16 { return int16(e >> 16) }
 // ---------------------------------------------------------------------------
 
 type fseValueDecoderEntry struct {
-	totalBits uint8  // state bits + extra value bits
-	valueBits uint8  // extra value bits
-	pad       uint16 // padding to align delta
-	delta     int16  // state base (delta)
-	pad2      int16  // padding
-	vbase     int32  // value base
+	totalBits uint8 // state bits + extra value bits
+	valueBits uint8 // extra value bits
+	delta     int16 // state base (delta)
+	vbase     int32 // value base
 }
 
 // ---------------------------------------------------------------------------

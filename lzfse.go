@@ -84,7 +84,6 @@ type v1Header struct {
 	lState               uint16
 	mState               uint16
 	dState               uint16
-	_pad                 uint16
 	lFreq                [lSymbols]uint16
 	mFreq                [mSymbols]uint16
 	dFreq                [dSymbols]uint16
@@ -184,62 +183,6 @@ var freqNBitsTable = [32]uint8{
 var freqValueTable = [32]int8{
 	0, 2, 1, 4, 0, 3, 1, -1, 0, 2, 1, 5, 0, 3, 1, -1,
 	0, 2, 1, 6, 0, 3, 1, -1, 0, 2, 1, 7, 0, 3, 1, -1,
-}
-
-// decodeV2FreqTable decodes the compressed freq table from a bit reader.
-// Returns the decoded frequencies (length = nSymbols) and the number of
-// bytes consumed.
-func decodeV2FreqTable(data []byte, nSymbols int) ([]uint16, int, error) {
-	freqs := make([]uint16, nSymbols)
-	// bit reader (forward, LSB-first)
-	var accum uint64
-	var accumBits int
-	pos := 0
-
-	refill := func() {
-		for accumBits <= 56 && pos < len(data) {
-			accum |= uint64(data[pos]) << uint(accumBits)
-			accumBits += 8
-			pos++
-		}
-	}
-
-	pull := func(n uint8) uint64 {
-		v := accum & ((1 << n) - 1)
-		accum >>= n
-		accumBits -= int(n)
-		return v
-	}
-
-	refill()
-	for i := 0; i < nSymbols; i++ {
-		refill()
-		lo5 := uint8(accum & 0x1F)
-		n := freqNBitsTable[lo5]
-		bits5 := pull(n)
-		// Decode value from bits5
-		var val uint16
-		switch {
-		case n == 2:
-			// 0b?0 → value = (bits5 >> 1) i.e. 0 or 1
-			val = uint16(bits5 >> 1)
-		case n == 3:
-			// 0b??1 → value = (bits5 >> 1) i.e. 1,2 or 3 depending on upper bits
-			val = 1 + uint16(bits5>>1)
-		case n == 8:
-			// value = 8 + ((bits5 >> 4) & 0xf)
-			// but bits5 contains the full 8-bit peek; lower 4 bits were 0b0111
-			val = 8 + uint16((bits5>>4)&0xF)
-		case n == 14:
-			val = 24 + uint16((bits5>>4)&0x3FF)
-		default:
-			return nil, 0, errors.New("lzfse: invalid freq code bits")
-		}
-		freqs[i] = val
-	}
-	// Return bytes consumed (round up)
-	bytesConsumed := (accumBits + 7) / 8
-	return freqs, pos - bytesConsumed, nil
 }
 
 // decodeV2FreqTableBitstream decodes all 4 freq tables
@@ -638,15 +581,13 @@ func Decompress(src []byte) ([]byte, error) {
 			pos = payloadEnd
 
 		case magicCompressedLZVN:
-			if pos+8 > len(src) {
-				return nil, errors.New("lzfse: LZVN block header truncated")
-			}
-			nRawBytes := int(binary.LittleEndian.Uint32(src[pos+4:]))
-			nPayloadBytes := int(binary.LittleEndian.Uint32(src[pos+8:])) // wait: struct is {magic, n_raw, n_payload}
-			_ = nRawBytes
+			// Header layout is { magic, n_raw_bytes, n_payload_bytes },
+			// so we need 12 bytes available before any field read.
 			if pos+12 > len(src) {
 				return nil, errors.New("lzfse: LZVN block header truncated")
 			}
+			nRawBytes := int(binary.LittleEndian.Uint32(src[pos+4:]))
+			nPayloadBytes := int(binary.LittleEndian.Uint32(src[pos+8:]))
 			pos += 12
 			if pos+nPayloadBytes > len(src) {
 				return nil, errors.New("lzfse: LZVN block payload truncated")

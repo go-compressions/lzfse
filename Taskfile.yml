@@ -1,0 +1,28 @@
+version: '3'
+
+env:
+  GOWORK: off  # works in the monorepo (overrides go.work) and in CI (no-op).
+
+tasks:
+  build:
+    desc: "Build the module"
+    cmds:
+      - go build -mod=mod ./...
+
+  test:
+    desc: "Run tests with coverage"
+    cmds:
+      - go test -mod=mod -race -coverprofile=cover.out ./...
+      - go tool cover -func=cover.out
+
+  lint:
+    desc: "Vet the module"
+    cmds:
+      - go vet -mod=mod ./...
+
+  ci:
+    desc: "Run lint + build + test (used by the GitHub Actions workflow)"
+    cmds:
+      - task: lint
+      - task: build
+      - task: test
