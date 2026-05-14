@@ -69,6 +69,11 @@ task ci      # lint + build + test, what CI runs
 Dependency updates are handled by Renovate ([renovate.json](renovate.json));
 patch and minor `gomod` updates auto-merge.
 
+This module is developed alongside other compression tooling in the
+[`go-compressions` umbrella](../README.md) of the upstream monorepo
+and published to its own `github.com/go-compressions/lzfse`
+repository via the umbrella's [`publish.sh`](../publish.sh) helper.
+
 ## Test coverage
 
 `task test` reports **100 % statement coverage** ([`cover.out`](cover.out)).
