@@ -45,6 +45,10 @@ func TestRoundtrip_TinyLZVN(t *testing.T) {
 		{"lzvn-very-long-match", longMatchPayload(3500)},
 		// Triggers the D == dPrev (pre_d / sml_m) encoder branch.
 		{"lzvn-repeated-distance", repeatedDistancePayload(3500)},
+		// Drives lzvnEmitLMD's `D == dPrev && L > 0` branch: a short
+		// match at distance D, then 1–2 literal bytes, then another
+		// match at the same distance D.
+		{"lzvn-pre_d-with-literal", preDWithLiteralPayload(2048)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { roundtrip(t, tc.name, tc.data) })
@@ -400,6 +404,170 @@ func TestLZVNDecode_DirectOpcodes(t *testing.T) {
 	}
 }
 
+// TestLZVNDecode_PreDWithLiteral exercises pre_d's L>0 path: a prior
+// distance is established, then a `pre_d` opcode copies L literal
+// bytes before reusing that distance.
+func TestLZVNDecode_PreDWithLiteral(t *testing.T) {
+	// Build:
+	// 1. sml_l 4 bytes "ABCD" → dpos=4
+	// 2. sml_d (opc 0x09: L=0 M=4 lo3=001) with b1=0x01 → D=(1<<8)|1=257.
+	//    But that needs dpos≥257. Use D=1 instead: opc lo3=000.
+	//    opc bits: LL=00 MMM=100 lo3=000 → M=4+3=7? wait MMM=100 → M = 4+3=7? Let me
+	//    check: M = ((opc>>3) & 0x07) + 3 = 4 + 3 = 7. opc=0x20 + low3=0.
+	//    But that overlaps med_d/sml_d encoding ambiguity? Actually opc=0x20 has
+	//    bits 0b0010_0000: top bit is 0, so it's not 1010 (med_d). lo3=000 → sml_d.
+	//    L=0 M=7 D=1. dpos was 4, now becomes 11.
+	// 3. pre_d (lo3=110) with L=1, M=4: opc bits LL=01 MMM=001 lo3=110 → 0x4E.
+	//    Wait MMM=001 → M = 1+3=4. Plus literal byte. After: copy 1 literal byte,
+	//    then 4 bytes via prev D=1 (matches last byte).
+	stream := []byte{
+		0xE4, 'A', 'B', 'C', 'D', // sml_l L=4
+		0x20, 0x01,               // sml_d L=0 M=7 D=1
+		0x4E, 'X',                // pre_d L=1 M=4 → copy "X" then 4 bytes from D=1 ("XXXX")
+	}
+	// Expected output:
+	//   ABCD (4) + DDDDDDD (7 'D's via D=1) + X (1) + XXXX (4 'X's via D=1) = 16 bytes
+	want := []byte("ABCDDDDDDDDXXXXX")
+	block := wrapLZVNBlock(stream, len(want))
+	got, err := Decompress(block)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got %q (%d bytes), want %q (%d bytes)", got, len(got), want, len(want))
+	}
+}
+
+// TestLZVNDecode_CopyMatchErrors crafts streams where the decoder
+// passes the opcode-level checks but lzvnCopyMatch then fails:
+// either D > dpos or dpos+M > dEnd.
+func TestLZVNDecode_CopyMatchErrors(t *testing.T) {
+	t.Run("sml_d-D-exceeds-dpos", func(t *testing.T) {
+		// sml_l 1 byte then sml_d with D=5 but dpos=1 → copyMatch fails
+		// since dpos - D < 0.
+		stream := []byte{
+			0xE1, 'A',  // sml_l 1
+			0x20, 0x05, // sml_d L=0 M=7 D=5
+		}
+		_, err := Decompress(wrapLZVNBlock(stream, 8))
+		if err == nil {
+			t.Fatal("expected invalid match distance error")
+		}
+	})
+	t.Run("lrg_d-D-exceeds-dpos", func(t *testing.T) {
+		// lrg_d (lo3=7) with L=0 M=0 D=10 followed by nothing else
+		// dpos starts at 0, D=10 → copyMatch fails.
+		stream := []byte{0x07, 0x0A, 0x00}
+		_, err := Decompress(wrapLZVNBlock(stream, 3))
+		if err == nil {
+			t.Fatal("expected invalid match distance error")
+		}
+	})
+	t.Run("med_d-D-exceeds-dpos", func(t *testing.T) {
+		// med_d L=0 M=0 D=5 with dpos=0
+		// b1: D bit2 in upper 6 bits = (5<<2)&0xFC = 0x14; M low2 = 0.
+		// b2: D high bits = 0.
+		// opc 0xA0: L=0, M=3 (from base 3), reads b1=0x14, b2=0x00 → D=(0x14>>2) | (0<<6) = 5
+		stream := []byte{0xA0, 0x14, 0x00}
+		_, err := Decompress(wrapLZVNBlock(stream, 3))
+		if err == nil {
+			t.Fatal("expected invalid match distance error")
+		}
+	})
+	t.Run("match-only-overflows-dEnd", func(t *testing.T) {
+		// Set a small dPrev via sml_d, then sml_m M=5 that overflows dEnd.
+		// Stream: sml_l 1 'A' → dpos=1; sml_d L=0 M=4 D=1 → dpos=5;
+		// sml_m M=5 → wants to copyMatch dpos=5, D=1, M=5 → dpos+M=10.
+		// nRaw=8 → dEnd=8 → 10 > 8 → match overflow in match-only path.
+		stream := []byte{
+			0xE1, 'A',
+			0x08, 0x01, // sml_d L=0 M=4 D=1
+			0xF5,       // sml_m M=5
+		}
+		_, err := Decompress(wrapLZVNBlock(stream, 8))
+		if err == nil {
+			t.Fatal("expected match-only overflow error")
+		}
+	})
+	t.Run("pre_d-overflows-dEnd", func(t *testing.T) {
+		// Set dPrev via sml_d, then pre_d (opc 0x1E: L=0 M=6) overflows.
+		// Stream: sml_l 1 → dpos=1; sml_d L=0 M=4 D=1 → dpos=5;
+		// pre_d L=0 M=6 → dpos+M=11, nRaw=8 → match overflow.
+		stream := []byte{
+			0xE1, 'A',
+			0x08, 0x01, // sml_d L=0 M=4 D=1
+			0x1E,       // pre_d L=0 M=6
+		}
+		_, err := Decompress(wrapLZVNBlock(stream, 8))
+		if err == nil {
+			t.Fatal("expected pre_d overflow error")
+		}
+	})
+	t.Run("match-only-D-exceeds-dpos", func(t *testing.T) {
+		// First set a small dPrev via sml_d: literal 1, then sml_d D=1 M=4.
+		// Output: "AAAAA" (5 bytes, dpos=5).
+		// Then sml_m M=5 (opc 0xF5) — uses dPrev=1, dpos+M=10. But nRaw=4,
+		// dEnd=4, so dpos+M = 5+5=10 > 4 → match overflow.
+		stream := []byte{
+			0xE1, 'A',
+			0x20, 0x01, // sml_d L=0 M=7 D=1
+			0xF5,
+		}
+		_, err := Decompress(wrapLZVNBlock(stream, 4))
+		if err == nil {
+			t.Fatal("expected match overflow error")
+		}
+	})
+}
+
+// TestLZVNDecode_LiteralOverflow_SmlD_LrgD targets the per-opcode
+// "literal overflow" branches in sml_d (line 132) and lrg_d (172).
+func TestLZVNDecode_LiteralOverflow_SmlDLrgD(t *testing.T) {
+	t.Run("sml_d-literal-overflow", func(t *testing.T) {
+		// sml_d L=3 M=3 D=1, but stream ends right after b1 (no literals)
+		// opc bits: LL=11 MMM=000 lo3=000 → 0xC0 plus we need lo3 in [0..5]
+		// to enter sml_d. opc=0xC0 has lo3=0. But opc>=0xC0 might match the
+		// match-only or different branch. Let me use 0xC1: lo3=1 → sml_d
+		// L=3 M=3 D=1.
+		// Actually opc>=0xC0 falls into `default` because case `opc>=0xE0`
+		// catches 0xE0+ and case 0xA0..0xC0 stops at <0xC0. So 0xC0..0xDF
+		// falls through to default → sml_d (lo3∈[0..5]).
+		// 0xC0: LL=11 MMM=000 lo3=0 → L=3 M=3 D=0+b1, needs 1 byte after for b1.
+		// Provide b1=0x01 (D=1). But no 3 literals follow → "sml_d literal overflow".
+		stream := []byte{0xC0, 0x01}
+		_, err := Decompress(wrapLZVNBlock(stream, 6))
+		if err == nil {
+			t.Fatal("expected sml_d literal overflow error")
+		}
+	})
+	t.Run("lrg_d-literal-overflow", func(t *testing.T) {
+		// lrg_d (lo3=7) L=3 M=3, but no literals after b1/b2.
+		// opc bits: LL=11 MMM=000 lo3=111 → 0xC7.
+		stream := []byte{0xC7, 0x01, 0x00}
+		_, err := Decompress(wrapLZVNBlock(stream, 6))
+		if err == nil {
+			t.Fatal("expected lrg_d literal overflow error")
+		}
+	})
+	t.Run("pre_d-literal-overflow", func(t *testing.T) {
+		// Set prior D via sml_d, then pre_d L=3 with no literals after.
+		// sml_d: opc 0x20 b1=0x01 → L=0 M=7 D=1, dpos=7 after literal "A"
+		// Wait we need a literal first. Use sml_l 1 + sml_d.
+		// Then pre_d (lo3=6) L=3 M=3: opc LL=11 MMM=000 lo3=110 → 0xC6.
+		// Stream: sml_l 1 "A" → dpos=1; sml_d L=0 M=4 D=1 → dpos=5;
+		// pre_d L=3 M=3 → tries to read 3 literal bytes → overflow.
+		stream := []byte{
+			0xE1, 'A',
+			0x20, 0x01, // sml_d L=0 M=7 D=1
+			0xC6,       // pre_d L=3 M=3
+		}
+		_, err := Decompress(wrapLZVNBlock(stream, 12))
+		if err == nil {
+			t.Fatal("expected pre_d literal overflow error")
+		}
+	})
+}
+
 // wrapLZVNBlock wraps a raw opcode stream in a bvxn block header
 // and bvx$ end-of-stream marker so it can be fed to Decompress.
 func wrapLZVNBlock(stream []byte, nRaw int) []byte {
@@ -515,6 +683,31 @@ func goodMatchPayload(n int) []byte {
 	marker := bytes.Repeat([]byte{'G'}, 60)
 	copy(out[64:], marker)
 	copy(out[2048:], marker)
+	return out
+}
+
+// preDWithLiteralPayload plants pairs of identical 4-byte windows
+// separated by a 1–2 byte gap so the encoder emits a (D == dPrev,
+// L > 0) record. Then a similar pair further away resumes the
+// same distance, triggering pre_d with literal preamble.
+func preDWithLiteralPayload(n int) []byte {
+	out := make([]byte, n)
+	copy(out, pseudoRandom(n, 53))
+	// Pattern: WW W X WW W   (W = unique 4 bytes, X = 1 byte)
+	w := pseudoRandom(4, 57)
+	off := 200
+	copy(out[off:], w)
+	out[off+4] = 'x'
+	copy(out[off+5:], w)
+	out[off+9] = 'y'
+	copy(out[off+10:], w)
+	// Replicate the pattern later at the same relative distance.
+	off2 := 800
+	copy(out[off2:], w)
+	out[off2+4] = 'x'
+	copy(out[off2+5:], w)
+	out[off2+9] = 'y'
+	copy(out[off2+10:], w)
 	return out
 }
 

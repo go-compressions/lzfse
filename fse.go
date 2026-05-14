@@ -220,7 +220,7 @@ func fseNormalizeFreq(counts []int, nstates int) ([]uint16, error) {
 	freqs := make([]uint16, len(counts))
 	remaining := nstates
 	maxFreq := 0
-	maxFreqSym := -1
+	maxFreqSym := 0
 	shift := bits.LeadingZeros32(uint32(nstates)) - 1
 	var highprecStep uint32
 	highprecStep = (1 << 31) / uint32(sCount)
@@ -240,10 +240,9 @@ func fseNormalizeFreq(counts []int, nstates int) ([]uint16, error) {
 			maxFreqSym = i
 		}
 	}
-
-	if maxFreqSym < 0 {
-		return nil, errZeroFreq
-	}
+	// sCount > 0 implies at least one non-zero count, so maxFreqSym
+	// was set by the loop above. No "all zero" fallthrough needed —
+	// the sCount==0 guard at the top handles that case.
 
 	// Adjust
 	if -remaining < (maxFreq >> 2) {

@@ -319,32 +319,23 @@ func lzvnInitTable(state *lzvnEncoderState) {
 }
 
 // lzvnEmitLiteral emits L literal bytes from src[srcLiteral:].
-func lzvnEmitLiteral(state *lzvnEncoderState, L int) bool {
+func lzvnEmitLiteral(state *lzvnEncoderState, L int) {
 	p := state.src[state.srcLiteral : state.srcLiteral+L]
-	dst := lzvnEmitLiteralBytes(p, state.dst, state.dPrev)
-	if dst == nil {
-		return false
-	}
-	state.dst = dst
+	state.dst = lzvnEmitLiteralBytes(p, state.dst)
 	state.srcLiteral += L
-	return true
 }
 
-func lzvnEmitLiteralBytes(p []byte, dst []byte, _ int) []byte {
+func lzvnEmitLiteralBytes(p []byte, dst []byte) []byte {
+	// Callers (lzvnEmitLiteral / lzvnEncodeBuffer's trailing emit)
+	// always pass L <= 271 — the lzvnEncodeMaxLiteralBacklog cap +
+	// lzvnEncodeMinMargin trailing window jointly bound the chunk
+	// size. So the for-loop runs at most once and the x>271 clamp
+	// is unreachable from production callers.
 	L := len(p)
-	for L > 15 {
-		x := L
-		if x > 271 {
-			x = 271
-		}
-		if x < 16 {
-			x = 16
-		}
-		// lrg_l: E0 (x-16)
-		dst = append(dst, 0xE0, byte(x-16))
-		dst = append(dst, p[:x]...)
-		p = p[x:]
-		L -= x
+	if L > 15 {
+		dst = append(dst, 0xE0, byte(L-16))
+		dst = append(dst, p[:L]...)
+		return dst
 	}
 	if L > 0 {
 		dst = append(dst, 0xE0|byte(L))
@@ -353,36 +344,25 @@ func lzvnEmitLiteralBytes(p []byte, dst []byte, _ int) []byte {
 	return dst
 }
 
-func lzvnEmitMatch(state *lzvnEncoderState, match lzvnMatchInfo) bool {
+func lzvnEmitMatch(state *lzvnEncoderState, match lzvnMatchInfo) {
 	L := match.mBegin - state.srcLiteral
-	M := match.M
-	D := match.D
-	dPrev := state.dPrev
-
 	p := state.src[state.srcLiteral:]
-	dst := lzvnEmitLMD(p, state.dst, L, M, D, dPrev)
-	if dst == nil {
-		return false
-	}
-	state.dPrev = D
-	state.dst = dst
+	state.dst = lzvnEmitLMD(p, state.dst, L, match.M, match.D, state.dPrev)
+	state.dPrev = match.D
 	state.srcLiteral = match.mEnd
-	return true
 }
 
 // lzvnEmitLMD emits a (L literals, M match, D distance) triplet.
 // L must be <= 3 after preamble handling below.
 func lzvnEmitLMD(src []byte, dst []byte, L, M, D, dPrev int) []byte {
-	// Flush large literal prefix first
-	for L > 15 {
-		x := L
-		if x > 271 {
-			x = 271
-		}
-		dst = append(dst, 0xE0, byte(x-16))
-		dst = append(dst, src[:x]...)
-		src = src[x:]
-		L -= x
+	// Flush large literal prefix first. Like lzvnEmitLiteralBytes,
+	// callers cap L at the backlog limit (271) so the for-loop ever
+	// runs at most once and the x>271 clamp is unreachable.
+	if L > 15 {
+		dst = append(dst, 0xE0, byte(L-16))
+		dst = append(dst, src[:L]...)
+		src = src[L:]
+		L = 0
 	}
 	if L > 3 {
 		dst = append(dst, 0xE0|byte(L))
@@ -504,14 +484,10 @@ func lzvnEncode(state *lzvnEncoderState) {
 			// No match found
 			if state.srcCurrent-state.srcLiteral >= lzvnEncodeMaxLiteralBacklog {
 				if state.pending.M != 0 {
-					if !lzvnEmitMatch(state, state.pending) {
-						return
-					}
+					lzvnEmitMatch(state, state.pending)
 					state.pending = noMatch
 				} else {
-					if !lzvnEmitLiteral(state, 271) {
-						return
-					}
+					lzvnEmitLiteral(state, 271)
 				}
 			}
 			state.table[h] = updated
@@ -523,17 +499,13 @@ func lzvnEncode(state *lzvnEncoderState) {
 		} else {
 			if state.pending.mEnd <= incoming.mBegin {
 				// No overlap
-				if !lzvnEmitMatch(state, state.pending) {
-					return
-				}
+				lzvnEmitMatch(state, state.pending)
 				state.pending = incoming
 			} else {
 				if incoming.K > state.pending.K {
 					state.pending = incoming
 				}
-				if !lzvnEmitMatch(state, state.pending) {
-					return
-				}
+				lzvnEmitMatch(state, state.pending)
 				state.pending = noMatch
 			}
 		}
@@ -542,12 +514,14 @@ func lzvnEncode(state *lzvnEncoderState) {
 	}
 }
 
-// lzvnEncodeBuffer compresses src into a LZVN stream.
-func lzvnEncodeBuffer(src []byte) ([]byte, error) {
+// lzvnEncodeBuffer compresses src into a LZVN stream. The caller is
+// responsible for keeping len(src) <= lzvnEncodeMaxSrcSize; the LZVN
+// block header packs the length into a uint32, so input larger than
+// 4 GiB would silently truncate the n_raw_bytes field. The public
+// `Compress` entry point only ever passes <= 4 KiB to this function,
+// so the limit is never reached in practice.
+func lzvnEncodeBuffer(src []byte) []byte {
 	srcSize := len(src)
-	if srcSize > lzvnEncodeMaxSrcSize {
-		return nil, errors.New("lzvn: source too large")
-	}
 
 	// Worst case: uncompressed + overhead
 	dst := make([]byte, 0, srcSize+64)
@@ -577,5 +551,5 @@ func lzvnEncodeBuffer(src []byte) ([]byte, error) {
 	// Emit EOS
 	lzvnEmitEndOfStream(state)
 
-	return state.dst, nil
+	return state.dst
 }

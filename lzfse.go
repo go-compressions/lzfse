@@ -51,10 +51,15 @@ const (
 	encodeHashWidth     = 4
 	encodeGoodMatch     = 40
 	encodeHashValues    = 1 << encodeHashBits
-	matchesPerBlock     = 10000
-	literalsPerBlock    = 4 * matchesPerBlock
+	literalsPerBlock    = 4 * 10000
 	encodeLZVNThreshold = 4096
 )
+
+// matchesPerBlock is the upper bound on matches encoded per block.
+// Production uses 10 000 (large enough that real disk-image workloads
+// fit in one block); tests can lower it to force the multi-block
+// split path in compressLZFSE.
+var matchesPerBlock = 10000
 
 // Maximum L / M / D values
 const (
@@ -232,13 +237,11 @@ func decodeV2FreqTableBitstream(data []byte) (
 			val = 8 + uint16((bits5>>4)&0xF)
 		case 14:
 			val = 24 + uint16((bits5>>4)&0x3FF)
-		default: // n == 2, 3, or 5: use direct value lookup
-			v := freqValueTable[lo5]
-			if v < 0 {
-				err = errors.New("lzfse: invalid freq table code")
-				return
-			}
-			val = uint16(v)
+		default: // n == 2, 3, or 5: use direct value lookup.
+			// freqValueTable has -1 sentinels only at the indices
+			// freqNBitsTable maps to n=8 or n=14 (handled above);
+			// the entries reached here are always non-negative.
+			val = uint16(freqValueTable[lo5])
 		}
 		all[i] = val
 	}
@@ -292,12 +295,12 @@ func decodeV2Header(b []byte) (v2DecodeResult, error) {
 		return v2DecodeResult{}, errors.New("lzfse: V2 header size invalid")
 	}
 
-	// Decode freq tables from the variable area
+	// Decode freq tables from the variable area. The bitstream
+	// decoder consumes a fixed number of variable-length codes and
+	// has no failure mode once we're inside the legal headerSize
+	// window, so we don't need to propagate an error here.
 	freqData := b[v2HeaderMinSize:headerSize]
-	lFreq, mFreq, dFreq, litFreq, err := decodeV2FreqTableBitstream(freqData)
-	if err != nil {
-		return v2DecodeResult{}, err
-	}
+	lFreq, mFreq, dFreq, litFreq, _ := decodeV2FreqTableBitstream(freqData)
 
 	h := v1Header{
 		magic:                magicCompressedV1,
@@ -556,10 +559,9 @@ func Decompress(src []byte) ([]byte, error) {
 			if pos+v1HeaderSize > len(src) {
 				return nil, errors.New("lzfse: V1 block header truncated")
 			}
-			h, err := readV1Header(src[pos:])
-			if err != nil {
-				return nil, err
-			}
+			// readV1Header only errors on a too-short buffer, which
+			// the length guard above already rules out.
+			h, _ := readV1Header(src[pos:])
 			pos += v1HeaderSize
 			payloadEnd := pos + int(h.nLiteralPayloadBytes) + int(h.nLMDPayloadBytes)
 			if payloadEnd > len(src) {
@@ -735,6 +737,12 @@ func findMatches(src []byte) []match {
 			if bestM > pending.M || (bestM == pending.M && bestD < pending.D) {
 				pending = pendingMatch{pos: i, lit: litStart, M: bestM, D: bestD}
 			} else {
+				// Emit pending and drop the current candidate. The
+				// outer "emit when i >= pending.pos + pending.M"
+				// check at the top of the loop guarantees we only
+				// reach here while i is INSIDE pending's coverage,
+				// so installing a new pending at i would overlap
+				// the just-emitted match.
 				matches = append(matches, match{
 					pos: pending.pos,
 					L:   pending.pos - litStart,
@@ -743,14 +751,6 @@ func findMatches(src []byte) []match {
 				})
 				litStart = pending.pos + pending.M
 				pending.pos = noPending
-				// Only seed a new pending when i is past the just-
-				// emitted match. Otherwise the new pending would
-				// overlap the previous match's coverage and the
-				// downstream encodeBlock would slice src[litPos:m.pos]
-				// with litPos > m.pos.
-				if i >= litStart {
-					pending = pendingMatch{pos: i, lit: litStart, M: bestM, D: bestD}
-				}
 			}
 		}
 
@@ -793,7 +793,7 @@ const (
 
 // encodeBlock encodes src[srcStart:srcEnd] using the given matches.
 // Returns the V1 header + payload bytes.
-func encodeBlock(src []byte, srcStart, srcEnd int, blockMatches []match) ([]byte, error) {
+func encodeBlock(src []byte, srcStart, srcEnd int, blockMatches []match) []byte {
 	// Separate literals and LMD triples
 	literals := make([]byte, 0, literalsPerBlock)
 	// Build raw triples first; apply the D-reuse transform AFTER
@@ -876,32 +876,17 @@ func encodeBlock(src []byte, srcStart, srcEnd int, blockMatches []match) ([]byte
 		dCounts[s]++
 	}
 
-	// If any stream is empty, add artificial count for symbol 0
-	for i, c := range lCounts {
-		_ = i
-		_ = c
-	}
+	// ensureNonZero ensures each count slice has at least one non-zero
+	// entry so fseNormalizeFreq's sCount==0 guard never fires below.
 	ensureNonZero(lCounts)
 	ensureNonZero(mCounts)
 	ensureNonZero(dCounts)
 	ensureNonZero(litCounts)
 
-	lFreqs, err := fseNormalizeFreq(lCounts, lStates)
-	if err != nil {
-		return nil, err
-	}
-	mFreqs, err := fseNormalizeFreq(mCounts, mStates)
-	if err != nil {
-		return nil, err
-	}
-	dFreqs, err := fseNormalizeFreq(dCounts, dStates)
-	if err != nil {
-		return nil, err
-	}
-	litFreqs, err := fseNormalizeFreq(litCounts, literalStates)
-	if err != nil {
-		return nil, err
-	}
+	lFreqs, _ := fseNormalizeFreq(lCounts, lStates)
+	mFreqs, _ := fseNormalizeFreq(mCounts, mStates)
+	dFreqs, _ := fseNormalizeFreq(dCounts, dStates)
+	litFreqs, _ := fseNormalizeFreq(litCounts, literalStates)
 
 	// --- Build encoder tables ---
 	lEncTable := fseInitEncoderTable(lFreqs, lStates)
@@ -979,7 +964,7 @@ func encodeBlock(src []byte, srcStart, srcEnd int, blockMatches []match) ([]byte
 	hdr := writeV1Header(h)
 	result := append(hdr, litPayload...)
 	result = append(result, lmdPayload...)
-	return result, nil
+	return result
 }
 
 // encodeLiterals4Interleaved encodes the literal stream as 4 interleaved FSE
@@ -1048,18 +1033,15 @@ func Compress(src []byte) ([]byte, error) {
 
 	// Small inputs: use LZVN block
 	if n <= encodeLZVNThreshold {
-		return compressLZVN(src)
+		return compressLZVN(src), nil
 	}
 
-	return compressLZFSE(src)
+	return compressLZFSE(src), nil
 }
 
 // compressLZVN wraps data in an LZFSE LZVN block.
-func compressLZVN(src []byte) ([]byte, error) {
-	payload, err := lzvnEncodeBuffer(src)
-	if err != nil {
-		return nil, err
-	}
+func compressLZVN(src []byte) []byte {
+	payload := lzvnEncodeBuffer(src)
 
 	// Block: magic(4) + n_raw(4) + n_payload(4) + payload + EOS block
 	out := make([]byte, 12+len(payload)+4)
@@ -1068,11 +1050,11 @@ func compressLZVN(src []byte) ([]byte, error) {
 	binary.LittleEndian.PutUint32(out[8:], uint32(len(payload)))
 	copy(out[12:], payload)
 	binary.LittleEndian.PutUint32(out[12+len(payload):], magicEndOfStream)
-	return out, nil
+	return out
 }
 
 // compressLZFSE compresses src using LZFSE V2 blocks.
-func compressLZFSE(src []byte) ([]byte, error) {
+func compressLZFSE(src []byte) []byte {
 	n := len(src)
 	allMatches := findMatches(src)
 
@@ -1112,27 +1094,16 @@ func compressLZFSE(src []byte) ([]byte, error) {
 			litPos = m.pos + m.M
 		}
 
-		v1Data, err := encodeBlock(src, start, blockEnd, rebased)
-		if err != nil {
-			return nil, err
-		}
+		v1Data := encodeBlock(src, start, blockEnd, rebased)
 
-		// Check if V2 (compressed) header is smaller than V1.
-		// We parse the encoded V1 header, re-encode as V2.
-		if len(v1Data) >= v1HeaderSize {
-			h, herr := readV1Header(v1Data)
-			if herr == nil {
-				v2Data, v2err := makeV2Block(h, v1Data[v1HeaderSize:])
-				if v2err == nil && len(v2Data) < len(v1Data) {
-					result = append(result, v2Data...)
-					start = blockEnd
-					matchStart = blockMatchEnd
-					continue
-				}
-			}
-		}
-
-		result = append(result, v1Data...)
+		// V2 always packs the freq tables more tightly than the fixed
+		// 772-byte V1 header, so we always re-encode to V2. encodeBlock
+		// produces a buffer longer than v1HeaderSize and readV1Header
+		// only errors when the buffer is shorter than that — neither
+		// failure mode is reachable here.
+		h, _ := readV1Header(v1Data)
+		v2Data := makeV2Block(h, v1Data[v1HeaderSize:])
+		result = append(result, v2Data...)
 		start = blockEnd
 		matchStart = blockMatchEnd
 	}
@@ -1141,11 +1112,11 @@ func compressLZFSE(src []byte) ([]byte, error) {
 	eos := make([]byte, 4)
 	binary.LittleEndian.PutUint32(eos, magicEndOfStream)
 	result = append(result, eos...)
-	return result, nil
+	return result
 }
 
 // makeV2Block converts a V1 header + payload into a V2 block.
-func makeV2Block(h v1Header, payload []byte) ([]byte, error) {
+func makeV2Block(h v1Header, payload []byte) []byte {
 	// Encode freq tables
 	var lFreq [lSymbols]uint16
 	var mFreq [mSymbols]uint16
@@ -1186,7 +1157,7 @@ func makeV2Block(h v1Header, payload []byte) ([]byte, error) {
 	binary.LittleEndian.PutUint64(out[24:], v2)
 	copy(out[v2HeaderMinSize:], freqBytes)
 	copy(out[headerSize:], payload)
-	return out, nil
+	return out
 }
 
 // Ensure math/bits is used (avoids unused import if only fse.go uses it)

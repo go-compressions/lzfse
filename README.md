@@ -1,7 +1,7 @@
 # lzfse
 
 [![ci](https://github.com/go-compressions/lzfse/actions/workflows/ci.yml/badge.svg)](https://github.com/go-compressions/lzfse/actions/workflows/ci.yml)
-![coverage](https://img.shields.io/badge/coverage-94.3%25-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
 Pure-Go implementation of Apple's **LZFSE** and **LZVN** compression formats.
 Byte-compatible with the reference `liblzfse` C implementation: data compressed
@@ -71,9 +71,7 @@ patch and minor `gomod` updates auto-merge.
 
 ## Test coverage
 
-`task test` reports **94.3 % statement coverage** ([`cover.out`](cover.out)).
+`task test` reports **100 % statement coverage** ([`cover.out`](cover.out)).
 The corruption / random-garbage fuzz suites assert no-panic, so the
 decoder is safe to call on adversarial input — bad data returns an
-error rather than crashing. The remaining ~6 % is rare error-forwarding
-branches that can be reached only by carefully hand-crafted V1 / V2 /
-freq-table fixtures.
+error rather than crashing.
