@@ -48,10 +48,10 @@ if err != nil { /* ... */ }
 
 ## Consumers
 
-- `pkg/go-compressions/lzfsec` — CLI wrapper (`lzfsec compress|decompress`).
-- `pkg/go-filesystems/apfs` — APFS `decmpfs` transparent decompression for
+- `github.com/go-compressions/lzfsec` — CLI wrapper (`lzfsec compress|decompress`).
+- `github.com/go-filesystems/apfs` — APFS `decmpfs` transparent decompression for
   types 7 / 8 / 11 / 12 (LZVN / LZFSE, inline + resource-fork variants).
-- `pkg/go-diskimages/tart-oci` — Tart layer decompression.
+- `github.com/go-diskimages/tart-oci` — Tart layer decompression.
 
 ## Development
 
@@ -68,11 +68,6 @@ task ci      # lint + build + test, what CI runs
 
 Dependency updates are handled by Renovate ([renovate.json](renovate.json));
 patch and minor `gomod` updates auto-merge.
-
-This module is developed alongside other compression tooling in the
-[`go-compressions` umbrella](../README.md) of the upstream monorepo
-and published to its own `github.com/go-compressions/lzfse`
-repository via the umbrella's [`publish.sh`](../publish.sh) helper.
 
 ## License
 
