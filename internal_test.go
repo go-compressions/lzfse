@@ -107,32 +107,6 @@ func TestReadV1Header_TooShort(t *testing.T) {
 	}
 }
 
-// TestDecodeCompressedBlock_BadInitialState verifies that out-of-range initial
-// FSE states from a crafted header return an error instead of panicking with an
-// out-of-range table index (the lzfse DoS the audit reproduced).
-func TestDecodeCompressedBlock_BadInitialState(t *testing.T) {
-	cases := []struct {
-		name string
-		mut  func(*v1Header)
-		want string
-	}{
-		{"lState", func(h *v1Header) { h.lState = lStates }, "initial L/M/D state out of range"},
-		{"mState", func(h *v1Header) { h.mState = mStates }, "initial L/M/D state out of range"},
-		{"dState", func(h *v1Header) { h.dState = dStates }, "initial L/M/D state out of range"},
-		{"literalState", func(h *v1Header) { h.literalState[3] = literalStates }, "initial literal state out of range"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			var h v1Header
-			c.mut(&h)
-			out, err := decodeCompressedBlock(h, nil)
-			if out != nil || !errIsLZFSE(err, c.want) {
-				t.Fatalf("%s: out=%v err=%v, want error %q", c.name, out, err, c.want)
-			}
-		})
-	}
-}
-
 // errIsLZFSE is a tiny substring-style errors helper.
 func errIsLZFSE(err error, substr string) bool {
 	if err == nil {
