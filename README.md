@@ -52,7 +52,9 @@ if err != nil { /* ... */ }
 
 This package is pure scalar Go (no SIMD kernel of its own). It is build+test
 validated for correctness across architectures: **ppc64le on real POWER10
-silicon** (GCC Compile Farm, Go 1.26.4, June 2026) and **ppc64 (big-endian) on
+silicon** (GCC Compile Farm, Go 1.26.4, June 2026), **riscv64 on a real SpacemiT
+X60** (RVV 1.0, a low-power in-order core — the only widely-available RVV
+silicon; GCC Compile Farm, Go 1.26.4, June 2026) and **ppc64 (big-endian) on
 real POWER9 silicon** — the big-endian run proving the codec is bit-exact on a
 big-endian target. s390x stays qemu-validated for correctness only; native
 s390x throughput is pending (no GitHub-hosted IBM Z runner). For the
