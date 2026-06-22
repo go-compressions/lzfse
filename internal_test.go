@@ -56,6 +56,32 @@ func TestFseInInit_ShortBuffers(t *testing.T) {
 	}
 }
 
+// TestFseInFlush_NearEndFallback drives the byte-at-a-time fallback in
+// fseInFlush taken when a full 8-byte word would read past the end of the
+// buffer (newPtr+8 > len(buf)). It must produce the same accumulator as the
+// bulk 8-byte load would on an equivalent in-range buffer.
+func TestFseInFlush_NearEndFallback(t *testing.T) {
+	// A short buffer: the read pointer sits close to the end so the bulk
+	// load is out of range and the byte loop runs instead.
+	buf := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	// init n!=0: ptr starts at end-8 = 0. Consume bits so a flush wants bytes,
+	// but keep newPtr such that newPtr+8 > len(buf).
+	s, err := fseInInit(buf, len(buf), -1)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	// Pull bits so accumNBits drops below 56, forcing the flush to load bytes.
+	_ = s.fseInPull(10)
+	ptr := len(buf) - 8 // 0
+	// Move ptr toward the end so the next flush's newPtr+8 exceeds len(buf).
+	ptr = len(buf) - 2 // 6: newPtr = 6 - nbytes, +8 > 8 for nbytes < 6
+	before := s.accumNBits
+	s.fseInFlush(buf, &ptr)
+	if s.accumNBits <= before {
+		t.Errorf("fseInFlush did not refill: nbits %d -> %d", before, s.accumNBits)
+	}
+}
+
 // TestLzvnCopyMatch_Errors directly drives the two error branches.
 func TestLzvnCopyMatch_Errors(t *testing.T) {
 	dst := make([]byte, 16)

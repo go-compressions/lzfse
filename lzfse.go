@@ -482,9 +482,18 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 
 	// --- Decode LMD stream and copy output ---
 	// Decode into the running stream so cross-block back-references resolve.
+	// Grow with amortised doubling, not to the exact size: a multi-block stream
+	// re-grows once per block, and an exact grow would realloc+copy the entire
+	// decoded-so-far output every time (O(n²) over the stream). Doubling makes
+	// the total copy work linear.
 	out := prior
 	if cap(out)-len(out) < int(h.nRawBytes) {
-		grown := make([]byte, len(out), len(out)+int(h.nRawBytes))
+		need := len(out) + int(h.nRawBytes)
+		grow := 2 * cap(out)
+		if grow < need {
+			grow = need
+		}
+		grown := make([]byte, len(out), grow)
 		copy(grown, out)
 		out = grown
 	}
@@ -532,10 +541,7 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 				if D <= 0 || int(D) > len(out) {
 					return nil, errors.New("lzfse: invalid match distance")
 				}
-				matchStart := len(out) - int(D)
-				for k := int32(0); k < M; k++ {
-					out = append(out, out[matchStart+int(k)])
-				}
+				out = matchCopy(out, len(out)-int(D), int(M))
 			}
 		}
 
@@ -544,6 +550,45 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 	}
 
 	return out, nil
+}
+
+// matchCopy appends an ml-byte LZ match to out, copying from out[mpos:]. The
+// destination region overlaps the source whenever the distance D (= len(out) -
+// mpos) is less than ml — LZFSE uses small distances for run-length fills. The
+// result is byte-identical to the scalar
+// `for k := 0; k < ml; k++ { out = append(out, out[mpos+k]) }` loop: each
+// output byte reads the byte one distance earlier in the output being built.
+//
+//   - D >= ml: source and destination are disjoint, so a single copy() — the
+//     runtime's word-at-a-time memmove — is exact.
+//   - D < ml: lay down the D-byte pattern, then grow it by repeatedly copying
+//     what is already written onto the tail, doubling the copied length each
+//     step. copy() within one slice is correct here because each doubling
+//     copies a region fully written before it is read.
+func matchCopy(out []byte, mpos, ml int) []byte {
+	start := len(out)
+	d := start - mpos
+	if start+ml <= cap(out) {
+		out = out[:start+ml]
+	} else {
+		out = append(out, make([]byte, ml)...)
+	}
+	dst := out[start:] // length ml, the region to fill
+	if d >= ml {
+		copy(dst, out[mpos:mpos+ml])
+		return out
+	}
+	copy(dst[:d], out[mpos:start])
+	filled := d
+	for filled < ml {
+		n := filled
+		if filled+n > ml {
+			n = ml - filled
+		}
+		copy(dst[filled:filled+n], dst[:n])
+		filled += n
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

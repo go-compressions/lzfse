@@ -4,6 +4,7 @@
 package lzfse
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/bits"
 )
@@ -136,10 +137,18 @@ func (s *fseInStream) fseInFlush(buf []byte, ptr *int) {
 		return
 	}
 	*ptr = newPtr
-	// Load nbytes bytes starting at newPtr, little-endian into incoming
+	// Load nbytes (<=7) bytes starting at newPtr, little-endian into incoming.
+	// When a full 8-byte little-endian word is in range we load it once and
+	// mask to nbits, avoiding the per-byte shift loop; otherwise (near the
+	// front edge of buf, where newPtr+8 would read past the end) fall back to
+	// the byte-at-a-time load.
 	var incoming uint64
-	for i := 0; i < nbytes; i++ {
-		incoming |= uint64(buf[newPtr+i]) << uint(i*8)
+	if newPtr+8 <= len(buf) {
+		incoming = binary.LittleEndian.Uint64(buf[newPtr:])
+	} else {
+		for i := 0; i < nbytes; i++ {
+			incoming |= uint64(buf[newPtr+i]) << uint(i*8)
+		}
 	}
 	// Shift accum left and OR in new bits
 	s.accum = (s.accum << uint(nbits)) | (incoming & ((1 << uint(nbits)) - 1))
