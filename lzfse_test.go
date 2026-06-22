@@ -809,3 +809,67 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TestRoundTrip_LargeMultiBlock exercises inputs big enough to span several
+// LZFSE blocks. It is a regression guard for two distinct bugs:
+//
+//  1. Cross-block back-references. The compressor splits the input into blocks
+//     at match boundaries, but LZFSE's history window spans those boundaries —
+//     a match near the start of a block may reference output produced in an
+//     earlier block. The decoder previously decoded each block into a fresh
+//     buffer and rejected such distances with "invalid match distance"; it now
+//     decodes into the running stream so they resolve.
+//
+//  2. The incompressible fallback. Random data that the FSE model cannot shrink
+//     must be stored in an uncompressed block rather than emitted as a broken
+//     compressed block.
+func TestRoundTrip_LargeMultiBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"prose-2MiB", englishProse(2 << 20)},
+		{"mixed-4MiB", mixedPayload(4 << 20)},
+		{"random-2MiB", pseudoRandom(2<<20, 99)},
+		{"zeros-2MiB", make([]byte, 2<<20)},
+		{"repetitive-4MiB", bytes.Repeat([]byte("The quick brown fox. "), (4<<20)/21)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			comp, err := Compress(tc.data)
+			if err != nil {
+				t.Fatalf("Compress: %v", err)
+			}
+			got, err := Decompress(comp)
+			if err != nil {
+				t.Fatalf("Decompress: %v", err)
+			}
+			if !bytes.Equal(got, tc.data) {
+				t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(tc.data))
+			}
+		})
+	}
+}
+
+// TestCompress_IncompressibleStored verifies that data the entropy coder cannot
+// model is stored (not expanded into a corrupt compressed block) and that the
+// stored form still round-trips.
+func TestCompress_IncompressibleStored(t *testing.T) {
+	src := pseudoRandom(256<<10, 123) // > encodeLZVNThreshold, incompressible
+	comp, err := Compress(src)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	// The stored form must never balloon the data beyond a tiny fixed overhead.
+	if len(comp) > len(src)+uncompressedOverhead {
+		t.Fatalf("incompressible data expanded: %d > %d+%d", len(comp), len(src), uncompressedOverhead)
+	}
+	got, err := Decompress(comp)
+	if err != nil {
+		t.Fatalf("Decompress: %v", err)
+	}
+	if !bytes.Equal(got, src) {
+		t.Fatalf("stored round-trip mismatch")
+	}
+}
+

@@ -183,7 +183,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		var h v1Header
 		h.nLiteralPayloadBytes = 100
 		h.nLMDPayloadBytes = 50
-		if _, err := decodeCompressedBlock(h, make([]byte, 10)); err == nil {
+		if _, err := decodeCompressedBlock(h, make([]byte, 10), nil); err == nil {
 			t.Fatal("expected payload too short error")
 		}
 	})
@@ -194,7 +194,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.literalFreq {
 			h.literalFreq[i] = 1000
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, nil); err == nil {
 			t.Fatal("expected literalFreq overflow error")
 		}
 	})
@@ -204,7 +204,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.lFreq {
 			h.lFreq[i] = 200
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, nil); err == nil {
 			t.Fatal("expected lFreq overflow error")
 		}
 	})
@@ -218,7 +218,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.mFreq {
 			h.mFreq[i] = 200 // sum past mStates (64)
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, nil); err == nil {
 			t.Fatal("expected mFreq overflow error")
 		}
 	})
@@ -230,7 +230,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.dFreq {
 			h.dFreq[i] = 100 // sum past dStates (256)
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, nil); err == nil {
 			t.Fatal("expected dFreq overflow error")
 		}
 	})
@@ -250,7 +250,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.literalBits = -3
 		h.nLiteralPayloadBytes = 5
 		payload := make([]byte, 5)
-		if _, err := decodeCompressedBlock(h, payload); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, nil); err == nil {
 			t.Fatal("expected literal-stream too short error")
 		}
 	})
@@ -267,7 +267,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.lmdBits = -3
 		h.nLMDPayloadBytes = 5
 		payload := make([]byte, 13)
-		if _, err := decodeCompressedBlock(h, payload); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, nil); err == nil {
 			t.Fatal("expected lmd-stream too short error")
 		}
 	})
@@ -636,5 +636,52 @@ func TestFseNormalizeFreq_AdjustmentBranches(t *testing.T) {
 	roundUp := []int{1000000, 1}
 	if _, err := fseNormalizeFreq(roundUp, 64); err != nil {
 		t.Errorf("fseNormalizeFreq(roundUp): %v", err)
+	}
+}
+
+// TestCompressLZFSE_LiteralOnlyBlockSplit forces the block splitter's
+// "no whole match fits in the raw-byte cap" branch, where a match-free span
+// longer than maxBlockRawBytes must be carved off and stored as a raw block.
+// It lowers maxBlockRawBytes so a small, deterministic input reaches the path,
+// then verifies the stream still round-trips.
+func TestCompressLZFSE_LiteralOnlyBlockSplit(t *testing.T) {
+	saved := maxBlockRawBytes
+	maxBlockRawBytes = 8192
+	defer func() { maxBlockRawBytes = saved }()
+
+	// A match-free prefix longer than the cap (random bytes whose first match,
+	// if any, starts past the cap) followed by a compressible tail. The prefix
+	// forces the splitter's "no whole match fits in the cap" branch; the tail
+	// keeps the whole stream on the compressLZFSE path rather than the
+	// top-level stored fallback. The cap (8 KiB) is comfortably larger than the
+	// maximum match length, so no single match can straddle a block boundary.
+	var prefix []byte
+	for seed := int64(1); ; seed++ {
+		cand := pseudoRandom(12*1024, seed)
+		ms := findMatches(cand)
+		ok := true
+		for _, m := range ms {
+			if m.pos < maxBlockRawBytes {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			prefix = cand
+			break
+		}
+		if seed > 50000 {
+			t.Fatal("could not synthesise a match-free prefix")
+		}
+	}
+	data := append(prefix, bytes.Repeat([]byte("compressible tail block "), 2000)...)
+
+	comp := compressLZFSE(data)
+	got, err := Decompress(comp)
+	if err != nil {
+		t.Fatalf("Decompress: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
 	}
 }
