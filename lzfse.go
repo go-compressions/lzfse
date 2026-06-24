@@ -408,7 +408,29 @@ func encodeV2FreqTableBitstream(
 // block may reference output produced in an earlier block. Decoding in place
 // (rather than into a fresh per-block buffer) is what makes those cross-block
 // distances resolve correctly.
-func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, error) {
+// decodeScratch holds the per-block working buffers — the four FSE decode
+// tables (fixed size) and the literals buffer (grown to the largest block) —
+// so a multi-block stream allocates them once instead of once per block. The
+// FSE-table allocation and the literals make() were the dominant cost of decode
+// (GC/madvise pressure), not the FSE inner loop; reusing them removes it.
+type decodeScratch struct {
+	litTable    []fseDecoderEntry
+	lValueTable []fseValueDecoderEntry
+	mValueTable []fseValueDecoderEntry
+	dValueTable []fseValueDecoderEntry
+	literals    []byte
+}
+
+func newDecodeScratch() *decodeScratch {
+	return &decodeScratch{
+		litTable:    make([]fseDecoderEntry, literalStates),
+		lValueTable: make([]fseValueDecoderEntry, lStates),
+		mValueTable: make([]fseValueDecoderEntry, mStates),
+		dValueTable: make([]fseValueDecoderEntry, dStates),
+	}
+}
+
+func decodeCompressedBlock(h v1Header, payload []byte, prior []byte, sc *decodeScratch) ([]byte, error) {
 	nLiterals := int(h.nLiterals)
 	nMatches := int(h.nMatches)
 	nLitPayload := int(h.nLiteralPayloadBytes)
@@ -421,29 +443,32 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 	litPayload := payload[:nLitPayload]
 	lmdPayload := payload[nLitPayload : nLitPayload+nLMDPayload]
 
-	// --- Build FSE tables ---
-	litTable := make([]fseDecoderEntry, literalStates)
+	// --- Build FSE tables (into reusable scratch) ---
+	litTable := sc.litTable
 	if err := fseInitDecoderTable(h.literalFreq[:], literalStates, litTable); err != nil {
 		return nil, err
 	}
 
-	lValueTable := make([]fseValueDecoderEntry, lStates)
+	lValueTable := sc.lValueTable
 	if err := fseInitValueDecoderTable(h.lFreq[:], lStates, lExtraBits[:], lBaseValue[:], lValueTable); err != nil {
 		return nil, err
 	}
 
-	mValueTable := make([]fseValueDecoderEntry, mStates)
+	mValueTable := sc.mValueTable
 	if err := fseInitValueDecoderTable(h.mFreq[:], mStates, mExtraBits[:], mBaseValue[:], mValueTable); err != nil {
 		return nil, err
 	}
 
-	dValueTable := make([]fseValueDecoderEntry, dStates)
+	dValueTable := sc.dValueTable
 	if err := fseInitValueDecoderTable(h.dFreq[:], dStates, dExtraBits[:], dBaseValue[:], dValueTable); err != nil {
 		return nil, err
 	}
 
-	// --- Decode literals (4 interleaved streams) ---
-	literals := make([]byte, nLiterals)
+	// --- Decode literals (4 interleaved streams) into the reusable buffer ---
+	if cap(sc.literals) < nLiterals {
+		sc.literals = make([]byte, nLiterals)
+	}
+	literals := sc.literals[:nLiterals]
 	{
 		litEnd := nLitPayload
 		n := int(h.literalBits)
@@ -486,17 +511,13 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 	// re-grows once per block, and an exact grow would realloc+copy the entire
 	// decoded-so-far output every time (O(n²) over the stream). Doubling makes
 	// the total copy work linear.
+	// Reserve copyOvershoot bytes of slack beyond nRawBytes so the LMD loop can
+	// over-copy a fixed 16 bytes for short literal/match runs (the dominant case)
+	// without a length-variable copy() call and without running off the end. The
+	// real output length is tracked by di and the slack is sliced off at the end.
 	out := prior
-	if cap(out)-len(out) < int(h.nRawBytes) {
-		need := len(out) + int(h.nRawBytes)
-		grow := 2 * cap(out)
-		if grow < need {
-			grow = need
-		}
-		grown := make([]byte, len(out), grow)
-		copy(grown, out)
-		out = grown
-	}
+	di := len(out)
+	out = growOut(out, di, int(h.nRawBytes)+copyOvershoot)
 	{
 		lEnd := nLMDPayload
 		in, err := fseInInit(lmdPayload, lEnd, int(h.lmdBits))
@@ -517,20 +538,36 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 
 		for i := 0; i < nMatches; i++ {
 			in.fseInFlush(lmdPayload, &ptr)
-			L := fseValueDecode(&lState, lValueTable, &in)
-			M := fseValueDecode(&mState, mValueTable, &in)
+			L := int(fseValueDecode(&lState, lValueTable, &in))
+			M := int(fseValueDecode(&mState, mValueTable, &in))
 			in.fseInFlush(lmdPayload, &ptr)
 			newD := fseValueDecode(&dState, dValueTable, &in)
 			if newD != 0 {
 				D = newD
 			}
+			// L and M are non-negative: their FSE value tables are built from
+			// non-negative base values plus an unsigned extra-bits field.
+			// Keep di+L+M plus the 16-byte over-copy slack inside the buffer.
+			// The reservation above is normally exact (sum == nRawBytes), so this
+			// only re-grows for the rare stream whose decoded size exceeds the
+			// header's nRawBytes; it preserves the panic-free, append-grow
+			// tolerance of the previous decoder.
+			if di+L+M+copyOvershoot > len(out) {
+				out = growOut(out, di, L+M+copyOvershoot)
+			}
 
-			// Copy L literals
-			end := litPos + int(L)
+			// Copy L literals by index. The common case (L <= 16 with room)
+			// takes a single fixed 16-byte copy the compiler inlines.
+			end := litPos + L
 			if end > len(literals) {
 				return nil, errors.New("lzfse: literal index out of range")
 			}
-			out = append(out, literals[litPos:end]...)
+			if L <= 16 && litPos+16 <= len(literals) {
+				copy(out[di:di+16], literals[litPos:litPos+16])
+			} else {
+				copy(out[di:di+L], literals[litPos:end])
+			}
+			di += L
 			litPos = end
 
 			// Copy M bytes from earlier in output. M == 0 happens for
@@ -538,57 +575,78 @@ func decodeCompressedBlock(h v1Header, payload []byte, prior []byte) ([]byte, er
 			// literal run exceeds maxLValue; the D value is logically
 			// irrelevant in that case so skip the distance check.
 			if M > 0 {
-				if D <= 0 || int(D) > len(out) {
+				d := int(D)
+				if d <= 0 || d > di {
 					return nil, errors.New("lzfse: invalid match distance")
 				}
-				out = matchCopy(out, len(out)-int(D), int(M))
+				mpos := di - d
+				// Short, non-overlapping match: one fixed 16-byte copy. The
+				// bytes past M are harmless read-ahead the next write overwrites.
+				if M <= 16 && d >= 16 {
+					copy(out[di:di+16], out[mpos:mpos+16])
+				} else {
+					matchCopyInto(out, di, mpos, M)
+				}
+				di += M
 			}
 		}
 
 		// Copy remaining literals
-		out = append(out, literals[litPos:]...)
+		rem := len(literals) - litPos
+		if di+rem > len(out) {
+			out = growOut(out, di, rem)
+		}
+		copy(out[di:di+rem], literals[litPos:])
+		di += rem
 	}
 
-	return out, nil
+	return out[:di], nil
 }
 
-// matchCopy appends an ml-byte LZ match to out, copying from out[mpos:]. The
-// destination region overlaps the source whenever the distance D (= len(out) -
-// mpos) is less than ml — LZFSE uses small distances for run-length fills. The
-// result is byte-identical to the scalar
-// `for k := 0; k < ml; k++ { out = append(out, out[mpos+k]) }` loop: each
-// output byte reads the byte one distance earlier in the output being built.
+// copyOvershoot is the number of bytes the LMD loop's fixed 16-byte short-run
+// copies may write past the logical output end; the buffer reserves this slack.
+const copyOvershoot = 16
+
+// growOut returns out re-sliced (and reallocated if needed) so that
+// out[:used+extra] is addressable, preserving out[:used]. It grows the backing
+// array with amortised doubling so a multi-block stream stays linear, and is the
+// index-write decoder's equivalent of the previous append-based growth.
+func growOut(out []byte, used, extra int) []byte {
+	need := used + extra
+	if need <= cap(out) {
+		return out[:need]
+	}
+	grow := 2 * cap(out)
+	if grow < need {
+		grow = need
+	}
+	grown := make([]byte, need, grow)
+	copy(grown, out[:used])
+	return grown
+}
+
+// matchCopyInto writes an ml-byte LZ match into out[di:di+ml], copying from
+// out[mpos:] (mpos = di-D). The caller has already ensured out has room. The
+// destination region overlaps the source whenever the distance D (= di-mpos) is
+// less than ml — LZFSE uses small distances for run-length fills. The result is
+// byte-identical to the scalar `for k := 0; k < ml; k++ { out[di+k] = out[mpos+k] }`
+// loop: each output byte reads the byte one distance earlier in the output.
 //
 //   - D >= ml: source and destination are disjoint, so a single copy() — the
 //     runtime's word-at-a-time memmove — is exact.
-//   - D < ml: lay down the D-byte pattern, then grow it by repeatedly copying
-//     what is already written onto the tail, doubling the copied length each
-//     step. copy() within one slice is correct here because each doubling
-//     copies a region fully written before it is read.
-func matchCopy(out []byte, mpos, ml int) []byte {
-	start := len(out)
-	d := start - mpos
-	if start+ml <= cap(out) {
-		out = out[:start+ml]
-	} else {
-		out = append(out, make([]byte, ml)...)
-	}
-	dst := out[start:] // length ml, the region to fill
+//   - D < ml: double the already-written pattern forward, clamped to the region
+//     end. copy() within one slice is correct because each doubling copies a
+//     region fully written before it is read.
+func matchCopyInto(out []byte, di, mpos, ml int) {
+	d := di - mpos
 	if d >= ml {
-		copy(dst, out[mpos:mpos+ml])
-		return out
+		copy(out[di:di+ml], out[mpos:mpos+ml])
+		return
 	}
-	copy(dst[:d], out[mpos:start])
-	filled := d
-	for filled < ml {
-		n := filled
-		if filled+n > ml {
-			n = ml - filled
-		}
-		copy(dst[filled:filled+n], dst[:n])
-		filled += n
+	expanded := out[mpos : di+ml] // length d+ml, the region being grown
+	for n := d; n < len(expanded); n *= 2 {
+		copy(expanded[n:], expanded[:n])
 	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +659,7 @@ func Decompress(src []byte) ([]byte, error) {
 	pos := 0
 	var out []byte
 	var err error
+	var sc *decodeScratch // lazily created on the first compressed block
 
 	for pos < len(src) {
 		if pos+4 > len(src) {
@@ -636,7 +695,10 @@ func Decompress(src []byte) ([]byte, error) {
 			if payloadEnd > len(src) {
 				return nil, errors.New("lzfse: V1 block payload truncated")
 			}
-			out, err = decodeCompressedBlock(h, src[pos:payloadEnd], out)
+			if sc == nil {
+				sc = newDecodeScratch()
+			}
+			out, err = decodeCompressedBlock(h, src[pos:payloadEnd], out, sc)
 			if err != nil {
 				return nil, err
 			}
@@ -656,7 +718,10 @@ func Decompress(src []byte) ([]byte, error) {
 			if payloadEnd > len(src) {
 				return nil, errors.New("lzfse: V2 block payload truncated")
 			}
-			out, err = decodeCompressedBlock(h, src[pos:payloadEnd], out)
+			if sc == nil {
+				sc = newDecodeScratch()
+			}
+			out, err = decodeCompressedBlock(h, src[pos:payloadEnd], out, sc)
 			if err != nil {
 				return nil, err
 			}
@@ -1185,6 +1250,7 @@ func compressLZFSE(src []byte) []byte {
 	// resolves match distances against the whole decompressed stream.
 	start := 0
 	matchStart := 0
+	verifySc := newDecodeScratch() // reused by the per-block round-trip check
 
 	for start < n {
 		// Find end of this block by the match cap first.
@@ -1267,7 +1333,7 @@ func compressLZFSE(src []byte) []byte {
 		// blocks, so it costs nothing on the hot path.
 		raw := src[start:blockEnd]
 		priorCopy := append([]byte(nil), decoded...)
-		dec, err := decodeCompressedBlock(h, v1Data[v1HeaderSize:], priorCopy)
+		dec, err := decodeCompressedBlock(h, v1Data[v1HeaderSize:], priorCopy, verifySc)
 		if err != nil || len(dec) < len(decoded) || !bytes.Equal(dec[len(decoded):], raw) {
 			result = append(result, storedBlock(raw)...)
 		} else {
