@@ -164,18 +164,41 @@ never reached:
 4. **Match-finder** — widen the hash table and add lazy matching (the lever
    `go-compressions/lz4` already uses to *beat* its reference on ratio) to both close
    the remaining ratio gap and reduce confirm overhead.
-5. **Byte-compatibility with Apple's stream** — see below; a prerequisite for using our
-   encoder as a drop-in for `.lzfse` artifacts consumed by Apple tooling.
+5. **LZFSE (`bvx2`) interop — both directions** — see below. (a) Fix the V2
+   *decoder* so reference `bvx2` streams decode correctly (today it silently
+   mis-decodes them); (b) align the V2 *encoder* bitstream so our `bvx2` output
+   decodes with Apple tooling. LZVN is already interoperable both ways.
 6. **Parallel blocks** — blocks are independent; a worker pool would give near-linear
    multi-core compression. Tracked separately from the single-core parity bar.
 
-## Cross-compatibility (known limitation)
+## Cross-compatibility (per-format; measured 2026-06-28)
 
-Our V2 FSE bitstream layout is **not yet byte-identical** to Apple's: a stream we
-produce does not decode with Apple's `lzfse` CLI, and vice versa, despite both using the
-`bvx2` block magic. Round-trip within our own codec is correct. Achieving bit-exact
-interop with the reference bitstream is action item 4 above and is required before we can
-claim "byte-compatible with Apple's lzfse".
+Verified on macOS against the reference `liblzfse` C library
+(`github.com/lzfse/lzfse`) and Apple's system `libcompression`
+(`compression_encode_buffer`/`compression_decode_buffer`, `COMPRESSION_LZFSE`) —
+which emit byte-identical streams to each other — over sizes 0 B … 700 KiB.
+Two distinct outcomes, by block format:
+
+- **LZVN (`bvxn`) and stored (`bvx-`) — fully interoperable both ways.** Across
+  480 cases (12 sizes × 40 seeds in the ≤ 4 KiB / LZVN range) every reference
+  `bvxn`/`bvx-` stream round-trips through our `Decompress`, and every
+  LZVN/stored stream our `Compress` emits decodes with the reference and with
+  `libcompression`, reconstructing the input byte-for-byte. For these inputs our
+  output is also byte-identical to the reference encoder's.
+
+- **LZFSE (`bvx2`) — not yet interoperable in either direction.** Our V2 FSE
+  bitstream layout is not byte-identical to Apple's: a `bvx2` stream we produce
+  does not decode with the reference, **and** — more seriously — a reference
+  `bvx2` stream does not decode correctly through our `Decompress`. The latter
+  fails *silently*: `Decompress` returns a `nil` error with wrong-length /
+  wrong-content output (e.g. 65538 bytes for a 65536-byte original) rather than
+  reporting an error. Only ~24/140 reference `bvx2` streams happened to
+  round-trip; the rest were silently corrupted.
+
+Round-trip **within** our own codec is correct for every format. Achieving
+bit-exact interop with the reference `bvx2` bitstream (both decode and encode) is
+action item 5 above; the silent mis-decode of foreign `bvx2` streams is a bug to
+fix in the V2 decoder, not merely an encoder-output difference.
 
 ## Reproduce
 

@@ -6,9 +6,23 @@
 ![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
 Pure-Go implementation of Apple's **LZFSE** and **LZVN** compression formats.
-Byte-compatible with the reference `liblzfse` C implementation: data compressed
-by `liblzfse` round-trips through `Decompress`, and data produced by `Compress`
-is decoded by `liblzfse` without modification.
+
+**Interoperability status** (verified on macOS against the reference `liblzfse`
+C library and Apple's system `libcompression`, which emit byte-identical
+streams):
+
+- **LZVN blocks (`bvxn`) and stored blocks (`bvx-`) are wire-interoperable both
+  ways.** A reference `bvxn`/`bvx-` stream round-trips through `Decompress`, and
+  the LZVN/stored output of `Compress` (inputs ≤ 4 KiB) decodes with `liblzfse`
+  / `libcompression` without modification — byte-for-byte equal to the original.
+- **LZFSE blocks (`bvx2`) are not yet interoperable in either direction.** Our
+  `bvx2` output does not decode with the reference, and a reference `bvx2` stream
+  does **not** decode correctly through `Decompress` today. Round-trip *within
+  this package* is correct for all formats; see the cross-compatibility note in
+  [BENCHMARKS.md](BENCHMARKS.md).
+
+The compressed output is **not byte-identical** to the reference encoder for
+LZFSE inputs (a different — but, for LZVN, interoperable — valid encoding).
 
 ## Module
 
@@ -26,15 +40,18 @@ func Decompress(src []byte) ([]byte, error)
 `Compress` picks the format automatically: inputs ≤ 4 KiB are emitted as an
 LZVN block (one `bvxn` block followed by `bvx$` end-of-stream); larger inputs
 are emitted as LZFSE blocks (V1/V2 headers + FSE-encoded streams).
-`Decompress` handles every block magic Apple's reference emits:
+`Decompress` recognises every block magic Apple's reference emits. It decodes
+its own streams of every kind, and reference `bvx-`/`bvxn` streams, correctly;
+decoding of reference `bvx1`/`bvx2` (LZFSE) streams is **not yet correct** (see
+the interoperability status above and [BENCHMARKS.md](BENCHMARKS.md)):
 
-| Magic  | Bytes  | Meaning                            |
-| ------ | ------ | ---------------------------------- |
-| `bvx-` | `2D…`  | Uncompressed payload (passthrough) |
-| `bvx1` | `31…`  | LZFSE V1 (uncompressed freq table) |
-| `bvx2` | `32…`  | LZFSE V2 (variable-length codes)   |
-| `bvxn` | `6E…`  | LZVN block                         |
-| `bvx$` | `24…`  | End-of-stream marker               |
+| Magic  | Bytes  | Meaning                            | Reference interop      |
+| ------ | ------ | ---------------------------------- | ---------------------- |
+| `bvx-` | `2D…`  | Uncompressed payload (passthrough) | yes                    |
+| `bvx1` | `31…`  | LZFSE V1 (uncompressed freq table) | not yet                |
+| `bvx2` | `32…`  | LZFSE V2 (variable-length codes)   | not yet                |
+| `bvxn` | `6E…`  | LZVN block                         | yes                    |
+| `bvx$` | `24…`  | End-of-stream marker               | yes                    |
 
 ## Usage
 
