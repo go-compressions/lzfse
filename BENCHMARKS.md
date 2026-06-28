@@ -164,10 +164,11 @@ never reached:
 4. **Match-finder** — widen the hash table and add lazy matching (the lever
    `go-compressions/lz4` already uses to *beat* its reference on ratio) to both close
    the remaining ratio gap and reduce confirm overhead.
-5. **LZFSE (`bvx2`) interop — both directions** — see below. (a) Fix the V2
-   *decoder* so reference `bvx2` streams decode correctly (today it silently
-   mis-decodes them); (b) align the V2 *encoder* bitstream so our `bvx2` output
-   decodes with Apple tooling. LZVN is already interoperable both ways.
+5. **LZFSE (`bvx2`) interop — both directions** — ✅ **DONE (2026-06-28)**. The
+   V2 decoder now decodes reference/Apple `bvx2` streams byte-exact (and errors
+   on malformed input instead of silently mis-decoding), and the V2 encoder
+   emits `bvx2` that both `liblzfse` and Apple `libcompression` decode byte-exact,
+   across single- and multi-block sizes. See the cross-compatibility section.
 6. **Parallel blocks** — blocks are independent; a worker pool would give near-linear
    multi-core compression. Tracked separately from the single-core parity bar.
 
@@ -177,28 +178,47 @@ Verified on macOS against the reference `liblzfse` C library
 (`github.com/lzfse/lzfse`) and Apple's system `libcompression`
 (`compression_encode_buffer`/`compression_decode_buffer`, `COMPRESSION_LZFSE`) —
 which emit byte-identical streams to each other — over sizes 0 B … 700 KiB.
-Two distinct outcomes, by block format:
+**All block formats are now interoperable both ways:**
 
-- **LZVN (`bvxn`) and stored (`bvx-`) — fully interoperable both ways.** Across
-  480 cases (12 sizes × 40 seeds in the ≤ 4 KiB / LZVN range) every reference
-  `bvxn`/`bvx-` stream round-trips through our `Decompress`, and every
+- **LZVN (`bvxn`) and stored (`bvx-`) — fully interoperable both ways.** Every
+  reference `bvxn`/`bvx-` stream round-trips through our `Decompress`, and every
   LZVN/stored stream our `Compress` emits decodes with the reference and with
   `libcompression`, reconstructing the input byte-for-byte. For these inputs our
   output is also byte-identical to the reference encoder's.
 
-- **LZFSE (`bvx2`) — not yet interoperable in either direction.** Our V2 FSE
-  bitstream layout is not byte-identical to Apple's: a `bvx2` stream we produce
-  does not decode with the reference, **and** — more seriously — a reference
-  `bvx2` stream does not decode correctly through our `Decompress`. The latter
-  fails *silently*: `Decompress` returns a `nil` error with wrong-length /
-  wrong-content output (e.g. 65538 bytes for a 65536-byte original) rather than
-  reporting an error. Only ~24/140 reference `bvx2` streams happened to
-  round-trip; the rest were silently corrupted.
+- **LZFSE (`bvx2`) — fully interoperable both ways (fixed 2026-06-28).** Across
+  every tested size and profile (20 sizes × 3 compressibility profiles, single-
+  and multi-block, plus a 12-size × dual-oracle sweep) every reference/Apple
+  `bvx2` stream decodes byte-exact through our `Decompress`, and every `bvx2`
+  stream our `Compress` emits decodes byte-exact with both `liblzfse` and Apple
+  `libcompression`. The output is a valid but not byte-identical encoding.
 
-Round-trip **within** our own codec is correct for every format. Achieving
-bit-exact interop with the reference `bvx2` bitstream (both decode and encode) is
-action item 5 above; the silent mis-decode of foreign `bvx2` streams is a bug to
-fix in the V2 decoder, not merely an encoder-output difference.
+  The fix had three parts, all rooted in divergences from reference
+  `lzfse_encode_base.c` / `lzfse_decode_base.c`:
+  1. **Decoder (silent corruption):** we appended the literals left over after
+     the last match to the output. Valid LZFSE consumes *every* output literal
+     via an `L` value (the encoder flushes a trailing literal run as a synthetic
+     `M=0` record), so those leftovers are just the 0–3 zero-padding literals and
+     must not be emitted. Removing the trailing-literal copy and asserting the
+     decoded block length equals `n_raw_bytes` makes foreign `bvx2` decode exact
+     and turns genuinely-malformed input into an error instead of wrong bytes.
+  2. **Encoder (undecodable output):** we left trailing literals uncovered (the
+     mirror of bug 1) and did not pad `n_literals` to a multiple of 4. We now
+     emit a synthetic `(L, M=0, D=1)` record for the trailing run and pad the
+     literal count, matching the reference exactly.
+  3. **Encoder (multi-block):** blocks could exceed the reference's hard per-block
+     limits (`n_literals ≤ 40000`, `n_matches ≤ 10000`, counting the *emitted*
+     records after long-run splits and the synthetic trailing record), which
+     reference/Apple decoders reject outright. Block closing now bounds emitted
+     literals and records within those limits.
+
+  Added validation (matching `lzfse_check_block_header_v1` / `fse_check_freq` /
+  `fse_in_checked_init`): freq-table bitstream must end exactly at the header
+  boundary and each table's frequencies must sum to ≤ its state count; block
+  literal/match counts and L/M/D FSE states must be in range; and the FSE input
+  stream's high bits must be zero. These make malformed `bvx2` error rather than
+  silently mis-decode. A `macos-latest` CI job (`./appleinterop`) links Apple's
+  `libcompression` and locks in two-way interop so this cannot regress.
 
 ## Reproduce
 

@@ -114,6 +114,13 @@ func fseInInit(buf []byte, end int, n int) (fseInStream, error) {
 			uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48
 		s.accumNBits = n + 56
 	}
+	// The reference (fse_in_checked_init64) requires the bits above accumNBits to
+	// be zero — the encoder zeroes them, so a non-zero value means the stream is
+	// corrupt. Rejecting it here makes malformed payloads error rather than
+	// decode into wrong output.
+	if s.accumNBits < 56 || s.accumNBits >= 64 || (s.accum>>uint(s.accumNBits)) != 0 {
+		return s, errors.New("fse: invalid stream init (nonzero high bits)")
+	}
 	return s, nil
 }
 

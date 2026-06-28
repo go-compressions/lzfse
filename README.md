@@ -9,20 +9,21 @@ Pure-Go implementation of Apple's **LZFSE** and **LZVN** compression formats.
 
 **Interoperability status** (verified on macOS against the reference `liblzfse`
 C library and Apple's system `libcompression`, which emit byte-identical
-streams):
+streams; both directions are exercised by the `macos-latest` CI job):
 
-- **LZVN blocks (`bvxn`) and stored blocks (`bvx-`) are wire-interoperable both
-  ways.** A reference `bvxn`/`bvx-` stream round-trips through `Decompress`, and
-  the LZVN/stored output of `Compress` (inputs ≤ 4 KiB) decodes with `liblzfse`
-  / `libcompression` without modification — byte-for-byte equal to the original.
-- **LZFSE blocks (`bvx2`) are not yet interoperable in either direction.** Our
-  `bvx2` output does not decode with the reference, and a reference `bvx2` stream
-  does **not** decode correctly through `Decompress` today. Round-trip *within
-  this package* is correct for all formats; see the cross-compatibility note in
-  [BENCHMARKS.md](BENCHMARKS.md).
+- **All block formats are wire-interoperable both ways** — stored (`bvx-`), LZVN
+  (`bvxn`), and **LZFSE (`bvx2`)**. A reference/Apple stream of any kind
+  round-trips byte-for-byte through `Decompress`, and the output of `Compress`
+  decodes byte-for-byte with `liblzfse` / `libcompression`, across sizes from a
+  single byte through multi-block streams (700 KB+).
+- Genuinely-malformed `bvx2` input (truncated/over-long freq tables, bad block
+  lengths, out-of-range FSE states) is **rejected with an error** rather than
+  silently decoded. (LZFSE has no per-block checksum, so a corrupted *payload*
+  bit decodes to wrong-but-valid-length output — exactly as in the reference,
+  byte-for-byte; that is inherent to the format, not a defect here.)
 
-The compressed output is **not byte-identical** to the reference encoder for
-LZFSE inputs (a different — but, for LZVN, interoperable — valid encoding).
+The compressed output is **not byte-identical** to the reference encoder (a
+different but fully valid — and decodable — encoding of the same data).
 
 ## Module
 
@@ -40,16 +41,15 @@ func Decompress(src []byte) ([]byte, error)
 `Compress` picks the format automatically: inputs ≤ 4 KiB are emitted as an
 LZVN block (one `bvxn` block followed by `bvx$` end-of-stream); larger inputs
 are emitted as LZFSE blocks (V1/V2 headers + FSE-encoded streams).
-`Decompress` recognises every block magic Apple's reference emits. It decodes
-its own streams of every kind, and reference `bvx-`/`bvxn` streams, correctly;
-decoding of reference `bvx1`/`bvx2` (LZFSE) streams is **not yet correct** (see
-the interoperability status above and [BENCHMARKS.md](BENCHMARKS.md)):
+`Decompress` recognises every block magic Apple's reference emits and decodes
+both its own streams and reference/Apple streams of every kind, byte-for-byte
+(see the interoperability status above and [BENCHMARKS.md](BENCHMARKS.md)):
 
 | Magic  | Bytes  | Meaning                            | Reference interop      |
 | ------ | ------ | ---------------------------------- | ---------------------- |
 | `bvx-` | `2D…`  | Uncompressed payload (passthrough) | yes                    |
-| `bvx1` | `31…`  | LZFSE V1 (uncompressed freq table) | not yet                |
-| `bvx2` | `32…`  | LZFSE V2 (variable-length codes)   | not yet                |
+| `bvx1` | `31…`  | LZFSE V1 (uncompressed freq table) | yes (decode)           |
+| `bvx2` | `32…`  | LZFSE V2 (variable-length codes)   | yes (both directions)  |
 | `bvxn` | `6E…`  | LZVN block                         | yes                    |
 | `bvx$` | `24…`  | End-of-stream marker               | yes                    |
 

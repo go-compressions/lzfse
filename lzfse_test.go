@@ -238,7 +238,7 @@ func TestLZVNDecode_DirectOpcodes(t *testing.T) {
 			want:   bytes.Repeat([]byte{'q'}, 16),
 		},
 		{
-			name:   "sml_l-literal-then-pre_d-match",
+			name: "sml_l-literal-then-pre_d-match",
 			// sml_l (0xE5) = literal of 5 bytes "abcab"
 			// then pre_d will fail (no prior D). Use sml_d first.
 			// sml_d: LLMMM_DDD = 00 100 010 → opc=0x22, L=0, M=4+3=7, D upper3=2
@@ -290,20 +290,20 @@ func TestLZVNDecode_DirectOpcodes(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "sml_d-truncated",
-			stream: []byte{0x08}, // sml_d with no follow byte
+			name:    "sml_d-truncated",
+			stream:  []byte{0x08}, // sml_d with no follow byte
 			nRaw:    0,
 			wantErr: true,
 		},
 		{
-			name: "lrg_d-truncated",
-			stream: []byte{0x07, 0x01}, // lrg_d needs 2 follow bytes
+			name:    "lrg_d-truncated",
+			stream:  []byte{0x07, 0x01}, // lrg_d needs 2 follow bytes
 			nRaw:    0,
 			wantErr: true,
 		},
 		{
-			name: "med_d-truncated",
-			stream: []byte{0xA0}, // needs 2 follow bytes
+			name:    "med_d-truncated",
+			stream:  []byte{0xA0}, // needs 2 follow bytes
 			nRaw:    0,
 			wantErr: true,
 		},
@@ -327,40 +327,40 @@ func TestLZVNDecode_DirectOpcodes(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:   "lrg_m-without-prior",
+			name: "lrg_m-without-prior",
 			// lrg_m=0xF0 with no prior D
 			stream:  []byte{0xF0, 0x05},
 			nRaw:    1,
 			wantErr: true,
 		},
 		{
-			name:   "sml_m-without-prior",
+			name: "sml_m-without-prior",
 			// 0xF5 = sml_m M=5 with no prior D
 			stream:  []byte{0xF5},
 			nRaw:    1,
 			wantErr: true,
 		},
 		{
-			name:   "lrg_l-truncated",
-			stream: []byte{0xE0}, // promises a length byte that's missing
-			nRaw:   1,
+			name:    "lrg_l-truncated",
+			stream:  []byte{0xE0}, // promises a length byte that's missing
+			nRaw:    1,
 			wantErr: true,
 		},
 		{
-			name:   "lrg_m-truncated",
-			stream: []byte{0xF0}, // missing the M byte
-			nRaw:   1,
+			name:    "lrg_m-truncated",
+			stream:  []byte{0xF0}, // missing the M byte
+			nRaw:    1,
 			wantErr: true,
 		},
 		{
-			name:   "sml_l-overflow",
+			name: "sml_l-overflow",
 			// sml_l with L=15 (0xEF) but no literal bytes after
 			stream:  []byte{0xEF},
 			nRaw:    15,
 			wantErr: true,
 		},
 		{
-			name:   "med_d-then-match",
+			name: "med_d-then-match",
 			// med_d opcode: 1 0 1 L L M M M, takes 2 follow bytes
 			// pick L=0, M=0 → med_d M=3, plus byte1 (low 2 bits of M, top 6 bits of D),
 			// byte2 (top 8 bits of D). Choose M=0 + b1.low2=0 (M=3), D=4 → b1=0x10 (D bits 0..5 = 4 shifted to bit2 = 0x10), b2=0.
@@ -373,7 +373,7 @@ func TestLZVNDecode_DirectOpcodes(t *testing.T) {
 			want: []byte("abcdabc"),
 		},
 		{
-			name:   "lrg_d-then-match",
+			name: "lrg_d-then-match",
 			// lrg_d: LLMMM111. Pick L=0 M=0 → M=3, b1,b2 = D lo16
 			// D=10, need 10 prior literal bytes.
 			stream: append(append(
@@ -422,8 +422,8 @@ func TestLZVNDecode_PreDWithLiteral(t *testing.T) {
 	//    then 4 bytes via prev D=1 (matches last byte).
 	stream := []byte{
 		0xE4, 'A', 'B', 'C', 'D', // sml_l L=4
-		0x20, 0x01,               // sml_d L=0 M=7 D=1
-		0x4E, 'X',                // pre_d L=1 M=4 → copy "X" then 4 bytes from D=1 ("XXXX")
+		0x20, 0x01, // sml_d L=0 M=7 D=1
+		0x4E, 'X', // pre_d L=1 M=4 → copy "X" then 4 bytes from D=1 ("XXXX")
 	}
 	// Expected output:
 	//   ABCD (4) + DDDDDDD (7 'D's via D=1) + X (1) + XXXX (4 'X's via D=1) = 16 bytes
@@ -446,7 +446,7 @@ func TestLZVNDecode_CopyMatchErrors(t *testing.T) {
 		// sml_l 1 byte then sml_d with D=5 but dpos=1 → copyMatch fails
 		// since dpos - D < 0.
 		stream := []byte{
-			0xE1, 'A',  // sml_l 1
+			0xE1, 'A', // sml_l 1
 			0x20, 0x05, // sml_d L=0 M=7 D=5
 		}
 		_, err := Decompress(wrapLZVNBlock(stream, 8))
@@ -482,7 +482,7 @@ func TestLZVNDecode_CopyMatchErrors(t *testing.T) {
 		stream := []byte{
 			0xE1, 'A',
 			0x08, 0x01, // sml_d L=0 M=4 D=1
-			0xF5,       // sml_m M=5
+			0xF5, // sml_m M=5
 		}
 		_, err := Decompress(wrapLZVNBlock(stream, 8))
 		if err == nil {
@@ -496,7 +496,7 @@ func TestLZVNDecode_CopyMatchErrors(t *testing.T) {
 		stream := []byte{
 			0xE1, 'A',
 			0x08, 0x01, // sml_d L=0 M=4 D=1
-			0x1E,       // pre_d L=0 M=6
+			0x1E, // pre_d L=0 M=6
 		}
 		_, err := Decompress(wrapLZVNBlock(stream, 8))
 		if err == nil {
@@ -559,7 +559,7 @@ func TestLZVNDecode_LiteralOverflow_SmlDLrgD(t *testing.T) {
 		stream := []byte{
 			0xE1, 'A',
 			0x20, 0x01, // sml_d L=0 M=7 D=1
-			0xC6,       // pre_d L=3 M=3
+			0xC6, // pre_d L=3 M=3
 		}
 		_, err := Decompress(wrapLZVNBlock(stream, 12))
 		if err == nil {
@@ -872,4 +872,3 @@ func TestCompress_IncompressibleStored(t *testing.T) {
 		t.Fatalf("stored round-trip mismatch")
 	}
 }
-

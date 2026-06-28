@@ -62,8 +62,11 @@ func TestFseInInit_ShortBuffers(t *testing.T) {
 // bulk 8-byte load would on an equivalent in-range buffer.
 func TestFseInFlush_NearEndFallback(t *testing.T) {
 	// A short buffer: the read pointer sits close to the end so the bulk
-	// load is out of range and the byte loop runs instead.
-	buf := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	// load is out of range and the byte loop runs instead. The last byte's
+	// high bit is kept clear so the init validity check (with n=-1, accumNBits
+	// is 63, so bit 63 must be zero — the reference's "encoder zeroes the upper
+	// bits" invariant) passes.
+	buf := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x08}
 	// init n!=0: ptr starts at end-8 = 0. Consume bits so a flush wants bytes,
 	// but keep newPtr such that newPtr+8 > len(buf).
 	s, err := fseInInit(buf, len(buf), -1)
@@ -170,6 +173,93 @@ func TestMakeV2Block_NeverErrors(t *testing.T) {
 	out := makeV2Block(h, []byte("x"))
 	if len(out) < v2HeaderMinSize+1 {
 		t.Fatalf("makeV2Block: too short: %d", len(out))
+	}
+}
+
+// TestFseInInit_NonZeroHighBits covers the validity check that rejects a
+// stream whose bits above accumNBits are non-zero (a valid encoder always
+// zeroes them; a non-zero value means the payload is corrupt).
+func TestFseInInit_NonZeroHighBits(t *testing.T) {
+	// n=-1 → accumNBits=63, so bit 63 must be 0. Set it to 1 to trip the check.
+	// (The n==0 path loads only 7 bytes = 56 bits, so its high bits are always
+	// zero and that branch cannot be tripped — the check is exercised here.)
+	buf := []byte{0, 0, 0, 0, 0, 0, 0, 0x80}
+	if _, err := fseInInit(buf, len(buf), -1); err == nil {
+		t.Fatal("expected non-zero-high-bits error")
+	}
+}
+
+// patchedV2Block returns a freshly compressed stream whose first bvx2 block has
+// had patch applied to its 32-byte header, for exercising decodeV2Header's
+// validation branches. It locates the bvx2 block (Compress may emit a stored
+// or LZVN block first only for tiny inputs; for the 8 KiB seed here the first
+// block is always bvx2).
+func patchedV2Block(t *testing.T, patch func(b []byte)) []byte {
+	t.Helper()
+	full, err := Compress(englishProse(8192))
+	if err != nil {
+		t.Fatalf("seed Compress: %v", err)
+	}
+	if len(full) < v2HeaderMinSize || binary.LittleEndian.Uint32(full) != magicCompressedV2 {
+		t.Fatalf("seed first block is not bvx2 (magic %08x)", binary.LittleEndian.Uint32(full))
+	}
+	patch(full[:v2HeaderMinSize])
+	return full
+}
+
+// TestDecodeV2Header_ValidationBranches drives each malformed-header rejection
+// added to decodeV2Header so corrupt streams error instead of mis-decoding.
+func TestDecodeV2Header_ValidationBranches(t *testing.T) {
+	cases := []struct {
+		name  string
+		patch func(b []byte)
+	}{
+		{"n_literals too large", func(b []byte) {
+			v0 := binary.LittleEndian.Uint64(b[8:])
+			v0 = (v0 &^ ((1 << 20) - 1)) | uint64(literalsPerBlock+4) // keep mult of 4
+			binary.LittleEndian.PutUint64(b[8:], v0)
+		}},
+		{"n_matches too large", func(b []byte) {
+			v0 := binary.LittleEndian.Uint64(b[8:])
+			v0 = (v0 &^ (((1 << 20) - 1) << 40)) | (uint64(matchesPerBlock+1) << 40)
+			binary.LittleEndian.PutUint64(b[8:], v0)
+		}},
+		{"n_literals not mult of 4", func(b []byte) {
+			v0 := binary.LittleEndian.Uint64(b[8:])
+			v0 = (v0 &^ ((1 << 20) - 1)) | 1
+			binary.LittleEndian.PutUint64(b[8:], v0)
+		}},
+		{"lmd_state out of range", func(b []byte) {
+			v2 := binary.LittleEndian.Uint64(b[24:])
+			// l_state is 10 bits at offset 32; lStates=64, so 1023 >= 64 trips it.
+			v2 = (v2 &^ (uint64(0x3FF) << 32)) | (uint64(0x3FF) << 32)
+			binary.LittleEndian.PutUint64(b[24:], v2)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stream := patchedV2Block(t, c.patch)
+			if _, err := Decompress(stream); err == nil {
+				t.Fatalf("%s: expected error, got nil", c.name)
+			}
+		})
+	}
+}
+
+// TestDecodeV2Header_FreqSumInvalid corrupts the freq-table bitstream length so
+// the decoded frequencies sum to more than the state count (fse_check_freq).
+func TestDecodeV2Header_FreqSumInvalid(t *testing.T) {
+	// Shrink the header_size field so the freq bitstream ends early / mismatched,
+	// which trips either the "did not end at header boundary" or the freq-sum
+	// check. Either way it must error rather than mis-decode.
+	stream := patchedV2Block(t, func(b []byte) {
+		v2 := binary.LittleEndian.Uint64(b[24:])
+		hs := uint32(v2 & 0xFFFFFFFF)
+		v2 = (v2 &^ 0xFFFFFFFF) | uint64(hs-1)
+		binary.LittleEndian.PutUint64(b[24:], v2)
+	})
+	if _, err := Decompress(stream); err == nil {
+		t.Fatal("expected freq-table validation error")
 	}
 }
 
@@ -297,12 +387,14 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 			t.Fatal("expected lmd-stream too short error")
 		}
 	})
-	t.Run("trailing-literal-grow", func(t *testing.T) {
-		// A header that decodes literals fine but promises more trailing
-		// literals (nLiterals) than the header's nRawBytes and has no matches:
-		// the trailing-literal copy must grow the output buffer rather than
-		// panic on a slice bound. sym-0 freq fills the whole literal table, so
-		// every literal decode yields sym 0 regardless of the bitstream.
+	t.Run("trailing-literals-not-emitted", func(t *testing.T) {
+		// Valid LZFSE never emits trailing literals that are not consumed by an
+		// L value (reference LZFSE flushes any pending literal run as a synthetic
+		// M=0 record, so n_raw_bytes == sum(L)+sum(M) always). A block with
+		// nMatches=0 therefore decodes to zero output regardless of how many
+		// literals its header declares; the declared literals are the encoder's
+		// up-to-3 padding literals plus slack and must NOT reach the output.
+		// nLiterals must be a multiple of 4 (the decoder enforces this).
 		var h v1Header
 		h.literalFreq[0] = 1024
 		h.lFreq[0] = 64
@@ -310,7 +402,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.dFreq[0] = 256
 		h.nLiterals = 40
 		h.nMatches = 0
-		h.nRawBytes = 0 // reservation = nRawBytes+copyOvershoot = 16 < 40 literals
+		h.nRawBytes = 0
 		h.literalBits = 0
 		h.nLiteralPayloadBytes = 8 // >= 7 for n==0 fseInInit
 		h.lmdBits = 0
@@ -320,8 +412,52 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(out) != 40 {
-			t.Fatalf("expected 40 trailing literals, got %d", len(out))
+		if len(out) != 0 {
+			t.Fatalf("trailing literals must not be emitted: got %d bytes", len(out))
+		}
+	})
+	t.Run("n_literals-not-mult-of-4", func(t *testing.T) {
+		// decodeCompressedBlock enforces n_literals % 4 == 0 directly (the public
+		// Decompress path also rejects this in decodeV2Header, but the block
+		// decoder is defensive on its own). nLiteralPayloadBytes is large enough
+		// that fseInInit succeeds before the literal loop's modulus check.
+		var h v1Header
+		h.literalFreq[0] = 1024
+		h.lFreq[0] = 64
+		h.mFreq[0] = 64
+		h.dFreq[0] = 256
+		h.nLiterals = 5 // not a multiple of 4
+		h.nMatches = 0
+		h.nRawBytes = 0
+		h.literalBits = 0
+		h.nLiteralPayloadBytes = 8
+		h.lmdBits = 0
+		h.nLMDPayloadBytes = 7
+		payload := make([]byte, 8+7)
+		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+			t.Fatal("expected n_literals-not-mult-of-4 error")
+		}
+	})
+	t.Run("raw-length-mismatch-errors", func(t *testing.T) {
+		// A block whose decoded length does not equal n_raw_bytes is malformed
+		// (or a decoder desync) and must error rather than return wrong bytes.
+		// Here nMatches=0 so the loop produces 0 bytes, but the header claims
+		// nRawBytes=8 — the mismatch must be caught.
+		var h v1Header
+		h.literalFreq[0] = 1024
+		h.lFreq[0] = 64
+		h.mFreq[0] = 64
+		h.dFreq[0] = 256
+		h.nLiterals = 40
+		h.nMatches = 0
+		h.nRawBytes = 8
+		h.literalBits = 0
+		h.nLiteralPayloadBytes = 8
+		h.lmdBits = 0
+		h.nLMDPayloadBytes = 7
+		payload := make([]byte, 8+7)
+		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+			t.Fatal("expected n_raw_bytes mismatch error")
 		}
 	})
 }

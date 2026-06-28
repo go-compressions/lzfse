@@ -37,6 +37,24 @@ jobs:
           echo "coverage=$pct"
           [ "$pct" = "100.0%" ] || { echo "coverage below 100%"; exit 1; }
 
+  # macOS interop guard. Links against Apple's system libcompression (always
+  # present on macOS) and verifies byte-exact two-way interop — our Compress
+  # decoded by Apple, and Apple's output decoded by us — across the LZVN (bvxn)
+  # and LZFSE (bvx2) paths and single/multi-block sizes. This locks in raw-
+  # stream interoperability so the bvx2 encode/decode can never silently regress.
+  # No third-party checkout is needed; only the system framework.
+  macos-interop:
+    name: macOS interop (libcompression)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: apple libcompression interop
+        run: CGO_ENABLED=1 go test -v ./appleinterop/
+
   # Cross-compiled test binaries run under QEMU. Covers the four remaining
   # 64-bit Go targets. s390x is BIG-ENDIAN, so this exercises the byte- and
   # bit-level LZFSE/LZVN entropy + bitstream code on the opposite endianness.
