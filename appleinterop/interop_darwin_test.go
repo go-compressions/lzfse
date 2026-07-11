@@ -69,3 +69,38 @@ func TestAppleInterop(t *testing.T) {
 		}
 	}
 }
+
+// TestAppleInteropLZVN guards the raw-LZVN block format (CompressLZVN /
+// DecompressLZVN) against Apple's COMPRESSION_LZVN in both directions. This
+// is the format APFS decmpfs stores for type-7 (inline) and type-8
+// (resource-fork) transparently-compressed files, so byte-exact interop
+// here is what lets go-filesystems/apfs write compressed files apfs.kext
+// reads.
+func TestAppleInteropLZVN(t *testing.T) {
+	// PRODUCE: our CompressLZVN -> Apple LZVN decode must be byte-exact at
+	// every size (this is what go-filesystems/apfs relies on when writing
+	// type-7/8 decmpfs chunks that apfs.kext then reads).
+	for _, n := range []int{0, 1, 7, 8, 16, 100, 1000, 4096, 16384, 65536, 131072} {
+		src := interopSample(n, int64(n)+999)
+		ours := lzfse.CompressLZVN(src)
+		dec, ok := appleLZVNDecode(ours, n)
+		if !ok || !bytes.Equal(dec, src) {
+			t.Errorf("n=%d PRODUCE: Apple could not byte-exactly decode our LZVN output (ok=%v len=%d/%d)",
+				n, ok, len(dec), n)
+		}
+	}
+	// CONSUME: Apple LZVN Compress -> our DecompressLZVN must be byte-exact.
+	// LZVN's block format only carries a match/literal engine for inputs of
+	// at least lzvnEncodeMinSrcSize (8) bytes; below that Apple emits a
+	// degenerate frame the decoder is not required to accept, and real
+	// decmpfs chunks are always far larger, so the CONSUME check starts at 8.
+	for _, n := range []int{8, 16, 100, 1000, 4096, 16384, 65536, 131072} {
+		src := interopSample(n, int64(n)+999)
+		appleEnc := appleLZVNEncode(src)
+		got, derr := lzfse.DecompressLZVN(appleEnc, n)
+		if derr != nil || !bytes.Equal(got, src) {
+			t.Errorf("n=%d CONSUME: we could not byte-exactly decode Apple's LZVN output (err=%v len=%d/%d)",
+				n, derr, len(got), n)
+		}
+	}
+}

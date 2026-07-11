@@ -872,3 +872,30 @@ func TestCompress_IncompressibleStored(t *testing.T) {
 		t.Fatalf("stored round-trip mismatch")
 	}
 }
+
+// TestCompressLZVN_RoundTrip covers the exported raw-LZVN block codec
+// (CompressLZVN / DecompressLZVN) across empty, tiny, compressible and
+// incompressible inputs, plus DecompressLZVN's error path on garbage.
+func TestCompressLZVN_RoundTrip(t *testing.T) {
+	cases := [][]byte{
+		nil,
+		[]byte("a"),
+		[]byte("the quick brown fox jumps over the lazy dog"),
+		bytes.Repeat([]byte("ABCD"), 20000),
+		pseudoRandom(70<<10, 7),
+	}
+	for i, src := range cases {
+		comp := CompressLZVN(src)
+		got, err := DecompressLZVN(comp, len(src))
+		if err != nil {
+			t.Fatalf("case %d: DecompressLZVN: %v", i, err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("case %d: round-trip mismatch (%d vs %d)", i, len(got), len(src))
+		}
+	}
+	// Error path: a truncated / invalid LZVN stream must not decode cleanly.
+	if _, err := DecompressLZVN([]byte{0xff, 0xff, 0xff, 0xff, 0xff}, 4096); err == nil {
+		t.Fatalf("expected error decoding garbage LZVN stream")
+	}
+}
