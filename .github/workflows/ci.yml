@@ -43,6 +43,38 @@ jobs:
   # and LZFSE (bvx2) paths and single/multi-block sizes. This locks in raw-
   # stream interoperability so the bvx2 encode/decode can never silently regress.
   # No third-party checkout is needed; only the system framework.
+  # Windows. The audit that prompted this found the fleet weaker on Windows
+  # (absent from 54.4% of the Go repositories) than on any exotic architecture,
+  # and a compressor is exactly the kind of library where a platform difference
+  # hides: buffer sizing, unaligned reads, and anything that assumed a
+  # separator or a page size.
+  #
+  # It is its own job rather than another entry in `native` because that matrix
+  # is about ARCHITECTURE and because -race there would drag cgo in; here the
+  # suite runs CGO-free, which is the library's own contract.
+  windows:
+    name: windows (amd64)
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+      - name: coverage gate (100%)
+        shell: bash
+        run: |
+          go test -covermode=atomic -coverprofile=cov.out ./...
+          pct=$(go tool cover -func=cov.out | awk '/^total:/{print $3}')
+          echo "coverage=$pct"
+          [ "$pct" = "100.0%" ] || { echo "coverage below 100%"; exit 1; }
+
+
   macos-interop:
     name: macOS interop (libcompression)
     runs-on: macos-latest
