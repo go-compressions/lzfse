@@ -85,6 +85,23 @@ func TestFseInFlush_NearEndFallback(t *testing.T) {
 	}
 }
 
+// TestFseInFlush_FrontEdge drives a flush that wants more bytes than remain
+// before ptr, which only a malformed stream reaches: it loads what remains and
+// never reads before the start of the buffer.
+func TestFseInFlush_FrontEdge(t *testing.T) {
+	buf := []byte{0x5A, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x08}
+	s, err := fseInInit(buf, len(buf), -1)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	ptr := len(buf) - 8 // one byte left
+	_ = s.fseInPull(20) // 43 bits left, so the flush wants two bytes
+	s.fseInFlush(buf, &ptr)
+	if ptr != 0 || s.accumNBits != 51 || s.accum&0xFF != 0x5A {
+		t.Errorf("fseInFlush: ptr=%d nbits=%d low byte=%#x, want 0, 51, 0x5a", ptr, s.accumNBits, s.accum&0xFF)
+	}
+}
+
 // TestLzvnCopyMatch_Errors directly drives the two error branches.
 func TestLzvnCopyMatch_Errors(t *testing.T) {
 	dst := make([]byte, 16)
@@ -299,7 +316,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		var h v1Header
 		h.nLiteralPayloadBytes = 100
 		h.nLMDPayloadBytes = 50
-		if _, err := decodeCompressedBlock(h, make([]byte, 10), nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, make([]byte, 10), 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected payload too short error")
 		}
 	})
@@ -310,7 +327,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.literalFreq {
 			h.literalFreq[i] = 1000
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected literalFreq overflow error")
 		}
 	})
@@ -320,7 +337,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.lFreq {
 			h.lFreq[i] = 200
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected lFreq overflow error")
 		}
 	})
@@ -334,7 +351,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.mFreq {
 			h.mFreq[i] = 200 // sum past mStates (64)
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected mFreq overflow error")
 		}
 	})
@@ -346,7 +363,7 @@ func TestDecodeCompressedBlock_ErrorPaths(t *testing.T) {
 		for i := range h.dFreq {
 			h.dFreq[i] = 100 // sum past dStates (256)
 		}
-		if _, err := decodeCompressedBlock(h, []byte{}, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, []byte{}, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected dFreq overflow error")
 		}
 	})
@@ -366,7 +383,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.literalBits = -3
 		h.nLiteralPayloadBytes = 5
 		payload := make([]byte, 5)
-		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected literal-stream too short error")
 		}
 	})
@@ -383,7 +400,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.lmdBits = -3
 		h.nLMDPayloadBytes = 5
 		payload := make([]byte, 13)
-		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected lmd-stream too short error")
 		}
 	})
@@ -408,7 +425,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.lmdBits = 0
 		h.nLMDPayloadBytes = 7 // >= 7 for n==0 fseInInit
 		payload := make([]byte, 8+7)
-		out, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch())
+		out, err := decodeCompressedBlock(h, payload, 0, nil, newDecodeScratch())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -434,7 +451,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.lmdBits = 0
 		h.nLMDPayloadBytes = 7
 		payload := make([]byte, 8+7)
-		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected n_literals-not-mult-of-4 error")
 		}
 	})
@@ -456,7 +473,7 @@ func TestDecodeCompressedBlock_FSEInInit(t *testing.T) {
 		h.lmdBits = 0
 		h.nLMDPayloadBytes = 7
 		payload := make([]byte, 8+7)
-		if _, err := decodeCompressedBlock(h, payload, nil, newDecodeScratch()); err == nil {
+		if _, err := decodeCompressedBlock(h, payload, 0, nil, newDecodeScratch()); err == nil {
 			t.Fatal("expected n_raw_bytes mismatch error")
 		}
 	})

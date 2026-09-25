@@ -3,6 +3,7 @@ package lzfse
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"math/rand"
 	"testing"
 )
@@ -131,6 +132,55 @@ func TestDecompress_BvxDollarOnly(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("bvx$ only: got %d bytes, want 0", len(got))
+	}
+}
+
+// TestDecompress_ShortLiteralPayload decodes streams from Apple's encoder
+// (libcompression, COMPRESSION_LZFSE) whose literal payload is shorter than
+// the FSE stream's first load: 8 bytes, or 7 when literal_bits is 0. Apple
+// pads only the L,M,D payload, and the reference decoder lets the literal
+// stream's first load reach back into the block header.
+func TestDecompress_ShortLiteralPayload(t *testing.T) {
+	cases := []struct {
+		name   string
+		stream string
+		want   []byte
+	}{
+		{
+			// One literal payload byte, literal_bits -4.
+			name: "literal-bits-nonzero",
+			stream: "6276783201100000080010000003003080020e38e00c0050850000002490000c" +
+				"e7d7700d0000005c03000000c04ff0937c0f0000000000000000000000000000" +
+				"00f0680100000000000000000000000000000000000000000000003c9a000000" +
+				"0000000000000000000000000000000000000000000000000000000000000000" +
+				"00000000000000000000000000003456ff3f62767824",
+			want: bytes.Repeat([]byte("a"), 4097),
+		},
+		{
+			// One literal payload byte, literal_bits 0.
+			name: "literal-bits-zero",
+			stream: "6276783204100000080010000003007000000c00c00c0070860000002490b00d" +
+				"e75c03d70000005c03000000c04ff03e7c0fdf03000000000000000000000000" +
+				"0000000000000000000000000000000000000000000000000000003c7a8f1e00" +
+				"0000000000000000000000000000000000000000000000000000000000000000" +
+				"000000000000000000000000000000a8b1faff62767824",
+			want: bytes.Repeat([]byte("ab"), 2050),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, err := hex.DecodeString(tc.stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := Decompress(src)
+			if err != nil {
+				t.Fatalf("Decompress: %v", err)
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Fatalf("Decompress: got %d bytes, want %d", len(got), len(tc.want))
+			}
+		})
 	}
 }
 
