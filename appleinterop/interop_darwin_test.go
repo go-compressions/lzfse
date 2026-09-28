@@ -18,6 +18,8 @@ package appleinterop
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -66,6 +68,50 @@ func TestAppleInterop(t *testing.T) {
 		if derr != nil || !bytes.Equal(got, src) {
 			t.Errorf("n=%d CONSUME: we could not byte-exactly decode Apple's output (err=%v len=%d/%d)",
 				n, derr, len(got), n)
+		}
+	}
+}
+
+// TestAppleInteropShortLiteralPayload covers blocks whose literal payload is
+// shorter than the FSE stream's first 7- or 8-byte load. Apple's encoder emits
+// them for blocks with few literals: runs of a short unit, and inputs that end
+// just past a block boundary, as a disk image's LZFSE chunk can.
+func TestAppleInteropShortLiteralPayload(t *testing.T) {
+	type sample struct {
+		name string
+		data []byte
+	}
+	var samples []sample
+	for _, unit := range []string{"a", "ab", "abc", "abcd"} {
+		for n := 4097; n <= 4160; n++ {
+			samples = append(samples, sample{fmt.Sprintf("repeat %q to %d bytes", unit, n), bytes.Repeat([]byte(unit), n)[:n]})
+		}
+	}
+	r := rand.New(rand.NewSource(7))
+	long := make([]byte, 200000)
+	for i := range long {
+		long[i] = byte('a' + r.Intn(4))
+	}
+	// n_raw_bytes of Apple's first block marks where its second block starts.
+	boundary := int(binary.LittleEndian.Uint32(appleLZFSEEncode(long)[4:]))
+	for k := 1; k <= 600; k += 7 {
+		samples = append(samples, sample{fmt.Sprintf("%d bytes past a block boundary", k), long[:boundary+k]})
+	}
+
+	for _, s := range samples {
+		ours, err := lzfse.Compress(s.data)
+		if err != nil {
+			t.Fatalf("%s: Compress: %v", s.name, err)
+		}
+		dec, ok := appleLZFSEDecode(ours, len(s.data))
+		if !ok || !bytes.Equal(dec, s.data) {
+			t.Errorf("%s PRODUCE: Apple could not byte-exactly decode our output (ok=%v len=%d/%d)",
+				s.name, ok, len(dec), len(s.data))
+		}
+		got, err := lzfse.Decompress(appleLZFSEEncode(s.data))
+		if err != nil || !bytes.Equal(got, s.data) {
+			t.Errorf("%s CONSUME: we could not byte-exactly decode Apple's output (err=%v len=%d/%d)",
+				s.name, err, len(got), len(s.data))
 		}
 	}
 }
