@@ -2,80 +2,34 @@
 
 package appleinterop
 
-/*
-#cgo LDFLAGS: -lcompression
-#include <stdlib.h>
-#include <compression.h>
+// The cgo call into libcompression moved to go-compressions/appleoracle, so
+// these four are now relays. They keep their signatures exactly, because the
+// test file around them is careful about what each size means and this change
+// is meant to move code, not to change a verdict.
+//
+// ⛔ appleLZFSEEncode and appleLZVNEncode still return an empty slice when the
+// platform declines, which is what they did when they wrapped
+// compression_encode_buffer directly. appleoracle reports that explicitly and
+// a NEW caller should use appleoracle.Encode's ok -- see the package doc
+// there. It is preserved here rather than fixed in the same commit so that a
+// green run afterwards means "the same thing, from one place" and nothing else.
 
-static size_t apple_lzfse_encode(unsigned char *dst, size_t dstcap,
-                                 const unsigned char *src, size_t n) {
-    return compression_encode_buffer(dst, dstcap, src, n, NULL, COMPRESSION_LZFSE);
-}
-static size_t apple_lzfse_decode(unsigned char *dst, size_t dstcap,
-                                 const unsigned char *src, size_t n) {
-    return compression_decode_buffer(dst, dstcap, src, n, NULL, COMPRESSION_LZFSE);
-}
-static size_t apple_lzvn_encode(unsigned char *dst, size_t dstcap,
-                                const unsigned char *src, size_t n) {
-    return compression_encode_buffer(dst, dstcap, src, n, NULL, (compression_algorithm)0x900);
-}
-static size_t apple_lzvn_decode(unsigned char *dst, size_t dstcap,
-                                const unsigned char *src, size_t n) {
-    return compression_decode_buffer(dst, dstcap, src, n, NULL, (compression_algorithm)0x900);
-}
-*/
-import "C"
+import "github.com/go-compressions/appleoracle"
 
-import "unsafe"
-
-// appleLZFSEEncode compresses src with Apple's system libcompression
-// (COMPRESSION_LZFSE) and returns the raw LZFSE stream.
 func appleLZFSEEncode(src []byte) []byte {
-	dstcap := len(src) + 4096
-	dst := make([]byte, dstcap)
-	var sp *C.uchar
-	if len(src) > 0 {
-		sp = (*C.uchar)(unsafe.Pointer(&src[0]))
-	}
-	n := C.apple_lzfse_encode((*C.uchar)(unsafe.Pointer(&dst[0])), C.size_t(dstcap), sp, C.size_t(len(src)))
-	return dst[:n]
+	out, _ := appleoracle.Encode(appleoracle.LZFSE, src)
+	return out
 }
 
-// appleLZFSEDecode decompresses an LZFSE stream with Apple's system
-// libcompression. ok reports whether exactly expect bytes were produced.
 func appleLZFSEDecode(src []byte, expect int) (out []byte, ok bool) {
-	dstcap := expect + 64
-	dst := make([]byte, dstcap)
-	var sp *C.uchar
-	if len(src) > 0 {
-		sp = (*C.uchar)(unsafe.Pointer(&src[0]))
-	}
-	n := C.apple_lzfse_decode((*C.uchar)(unsafe.Pointer(&dst[0])), C.size_t(dstcap), sp, C.size_t(len(src)))
-	return dst[:n], int(n) == expect
+	return appleoracle.Decode(appleoracle.LZFSE, src, expect)
 }
 
-// appleLZVNEncode compresses src with Apple's system libcompression
-// ((compression_algorithm)0x900) and returns the raw LZVN block stream.
 func appleLZVNEncode(src []byte) []byte {
-	dstcap := len(src) + 4096
-	dst := make([]byte, dstcap)
-	var sp *C.uchar
-	if len(src) > 0 {
-		sp = (*C.uchar)(unsafe.Pointer(&src[0]))
-	}
-	n := C.apple_lzvn_encode((*C.uchar)(unsafe.Pointer(&dst[0])), C.size_t(dstcap), sp, C.size_t(len(src)))
-	return dst[:n]
+	out, _ := appleoracle.Encode(appleoracle.LZVN, src)
+	return out
 }
 
-// appleLZVNDecode decompresses a raw LZVN block stream with Apple's system
-// libcompression. ok reports whether exactly expect bytes were produced.
 func appleLZVNDecode(src []byte, expect int) (out []byte, ok bool) {
-	dstcap := expect + 64
-	dst := make([]byte, dstcap)
-	var sp *C.uchar
-	if len(src) > 0 {
-		sp = (*C.uchar)(unsafe.Pointer(&src[0]))
-	}
-	n := C.apple_lzvn_decode((*C.uchar)(unsafe.Pointer(&dst[0])), C.size_t(dstcap), sp, C.size_t(len(src)))
-	return dst[:n], int(n) == expect
+	return appleoracle.Decode(appleoracle.LZVN, src, expect)
 }
