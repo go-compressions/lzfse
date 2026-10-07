@@ -6,6 +6,6 @@ module github.com/go-compressions/lzfse/benchmarks
 
 go 1.26
 
-require github.com/go-compressions/lzfse v0.4.1
+require github.com/go-compressions/lzfse v0.5.0
 
 replace github.com/go-compressions/lzfse => ../
