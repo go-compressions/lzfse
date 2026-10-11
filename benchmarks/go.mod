@@ -4,7 +4,7 @@
 // harness is a measurement tool, not part of the library's tested surface.
 module github.com/go-compressions/lzfse/benchmarks
 
-go 1.26
+go 1.27.1
 
 require github.com/go-compressions/lzfse v0.5.0
 
