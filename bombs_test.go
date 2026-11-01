@@ -57,7 +57,17 @@ func TestAnLZVNBlockCannotDeclareMoreThanItsPayloadEncodes(t *testing.T) {
 // A V1 header's counts are checked before decodeCompressedBlock allocates
 // them, as the V2 path always was.
 func TestAV1BlockIsCheckedBeforeAllocating(t *testing.T) {
+	badState := func(off int, v uint16) []byte {
+		b := v1Block(4, 4, 0)
+		binary.LittleEndian.PutUint16(b[off:], v)
+		return b
+	}
 	cases := map[string][]byte{
+		// FuzzDecompress found this one: a header state indexed 12336 into
+		// the 1024-entry literal table. Written out here because the
+		// emulated CI lanes run a test binary away from testdata/.
+		"literal state past its table":      badState(32, literalStates),
+		"L state past its table":            badState(44, lStates),
 		"literals past the reference limit": v1Block(4, literalsPerBlock+4, 0),
 		"matches past the reference limit":  v1Block(4, 4, uint32(matchesPerBlock)+1),
 		"raw past literals and matches":     v1Block(1<<30, 4, 0),
