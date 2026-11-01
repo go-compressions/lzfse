@@ -35,8 +35,28 @@ github.com/go-compressions/lzfse
 
 ```go
 func Compress(src []byte) ([]byte, error)
-func Decompress(src []byte) ([]byte, error)
+func Decompress(src []byte) ([]byte, error)                   // up to DefaultMaxOutput (1 GiB)
+func DecompressLimit(src []byte, maxOut int) ([]byte, error)  // ErrTooLarge past maxOut
 ```
+
+### Untrusted input
+
+Decompression turns a few bytes into many, so every size a stream declares is
+checked before anything is allocated (v0.6.0). ⛔ Measured before: a **17-byte**
+stream (an LZVN block declaring 1 GiB of output over one payload byte)
+allocated **1 GiB** and returned no error, and V1 and V2 blocks allocated
+whatever raw size or literal count they declared.
+
+- **Structural bounds**, exact and free: an LZVN payload byte produces at most
+  136 output bytes (`lrg_m`: 2 bytes, 271 out — Apple's `lzvn_decode_base.c`);
+  a compressed block at most its literals plus `nMatches × 2359`; V1 headers
+  get the reference's limits (40 000 literals, 10 000 matches) and every
+  initial FSE state is checked against its table (an unchecked one indexed
+  past a 1024-entry table, found by `FuzzDecompress`).
+- **A ceiling** for what compression legitimately produces: `Decompress` stops
+  at `DefaultMaxOutput`; `DecompressLimit` takes yours and returns
+  `ErrTooLarge` before the block that would pass it is decoded.
+- Lengths are compared in `uint64`, so a 32-bit build cannot wrap past a check.
 
 `Compress` picks the format automatically: inputs ≤ 4 KiB are emitted as an
 LZVN block (one `bvxn` block followed by `bvx$` end-of-stream); larger inputs

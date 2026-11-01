@@ -724,13 +724,61 @@ func matchCopyInto(out []byte, di, mpos, ml int) {
 // Decompress
 // ---------------------------------------------------------------------------
 
-// Decompress decompresses LZFSE-compressed data.
-// dstLen is a hint for the decompressed size (0 = unknown, allocate dynamically).
+// DefaultMaxOutput is the most bytes [Decompress] returns: 1 GiB. LZFSE
+// legitimately expands a few bytes into many (an LZVN match opcode turns 2
+// bytes into 271), so only a ceiling bounds the result; [DecompressLimit]
+// sets another.
+const DefaultMaxOutput = 1 << 30
+
+// ErrTooLarge reports a stream that would decompress past the ceiling.
+var ErrTooLarge = errors.New("lzfse: decompressed size past the ceiling")
+
+// lzvnMaxExpansion is the most output bytes one LZVN payload byte can
+// produce, rounded up: lrg_m, 2 bytes for a match of up to 16+255 = 271
+// (lzfse/lzfse src/lzvn_decode_base.c). Every other opcode emits less per
+// byte. A block declaring more raw bytes than this allows cannot be valid.
+const lzvnMaxExpansion = 136
+
+// rawFitsBlock reports whether a compressed block's declared raw size is one
+// its literals and matches can produce: every output byte is a literal or
+// part of a match of at most maxMValue. decodeCompressedBlock reserves the
+// declared size before decoding, so a block declaring 4 GiB over a handful of
+// symbols allocated it.
+func rawFitsBlock(h v1Header) bool {
+	if uint64(h.nRawBytes) > uint64(h.nLiterals)+uint64(h.nMatches)*maxMValue {
+		return false
+	}
+	// The initial FSE states index their decoder tables; the reference's
+	// lzfse_check_block_header_v1 bounds each one. Unchecked, a state from
+	// the header indexed past a 1024-entry table (found by FuzzDecompress).
+	for _, s := range h.literalState {
+		if int(s) >= literalStates {
+			return false
+		}
+	}
+	return int(h.lState) < lStates && int(h.mState) < mStates && int(h.dState) < dStates
+}
+
+// Decompress decompresses LZFSE-compressed data, up to [DefaultMaxOutput].
 func Decompress(src []byte) ([]byte, error) {
+	return DecompressLimit(src, DefaultMaxOutput)
+}
+
+// DecompressLimit is [Decompress] refusing, with [ErrTooLarge], a stream that
+// declares or produces more than maxOut bytes. Nothing is allocated from a
+// size field before it is checked: an LZVN block once allocated its declared
+// n_raw_bytes (up to 4 GiB) from a 17-byte input, and a V1 block its declared
+// literal count.
+func DecompressLimit(src []byte, maxOut int) ([]byte, error) {
 	pos := 0
 	var out []byte
 	var err error
 	var sc *decodeScratch // lazily created on the first compressed block
+	// fits reports whether n more bytes keep out within maxOut; uint64, so
+	// a 32-bit field cannot wrap past the check on a 32-bit build.
+	fits := func(n uint64) bool { return uint64(len(out))+n <= uint64(maxOut) }
+	// avail reports whether n bytes from pos are inside src.
+	avail := func(n uint64) bool { return uint64(pos)+n <= uint64(len(src)) }
 
 	for pos < len(src) {
 		if pos+4 > len(src) {
@@ -746,11 +794,15 @@ func Decompress(src []byte) ([]byte, error) {
 			if pos+8 > len(src) {
 				return nil, errors.New("lzfse: uncompressed block header truncated")
 			}
-			n := int(binary.LittleEndian.Uint32(src[pos+4:]))
+			n32 := uint64(binary.LittleEndian.Uint32(src[pos+4:]))
 			pos += 8
-			if pos+n > len(src) {
+			if !avail(n32) {
 				return nil, errors.New("lzfse: uncompressed block data truncated")
 			}
+			if !fits(n32) {
+				return nil, ErrTooLarge
+			}
+			n := int(n32)
 			out = append(out, src[pos:pos+n]...)
 			pos += n
 
@@ -762,10 +814,23 @@ func Decompress(src []byte) ([]byte, error) {
 			// the length guard above already rules out.
 			h, _ := readV1Header(src[pos:])
 			pos += v1HeaderSize
-			payloadEnd := pos + int(h.nLiteralPayloadBytes) + int(h.nLMDPayloadBytes)
-			if payloadEnd > len(src) {
+			// The limits the V2 header path already enforces (and the
+			// reference's lzfse_check_block_header_v1): without them a V1
+			// block allocated whatever literal count it declared.
+			if h.nLiterals > literalsPerBlock || h.nMatches > uint32(matchesPerBlock) {
+				return nil, errors.New("lzfse: V1 block declares too many literals or matches")
+			}
+			payload := uint64(h.nLiteralPayloadBytes) + uint64(h.nLMDPayloadBytes)
+			if !avail(payload) {
 				return nil, errors.New("lzfse: V1 block payload truncated")
 			}
+			if !rawFitsBlock(h) {
+				return nil, errors.New("lzfse: V1 block declares more raw bytes than its literals and matches can produce")
+			}
+			if !fits(uint64(h.nRawBytes)) {
+				return nil, ErrTooLarge
+			}
+			payloadEnd := pos + int(payload)
 			if sc == nil {
 				sc = newDecodeScratch()
 			}
@@ -785,10 +850,17 @@ func Decompress(src []byte) ([]byte, error) {
 			}
 			pos += res.headerSize
 			h := res.v1Header
-			payloadEnd := pos + int(h.nLiteralPayloadBytes) + int(h.nLMDPayloadBytes)
-			if payloadEnd > len(src) {
+			payload := uint64(h.nLiteralPayloadBytes) + uint64(h.nLMDPayloadBytes)
+			if !avail(payload) {
 				return nil, errors.New("lzfse: V2 block payload truncated")
 			}
+			if !rawFitsBlock(h) {
+				return nil, errors.New("lzfse: V2 block declares more raw bytes than its literals and matches can produce")
+			}
+			if !fits(uint64(h.nRawBytes)) {
+				return nil, ErrTooLarge
+			}
+			payloadEnd := pos + int(payload)
 			if sc == nil {
 				sc = newDecodeScratch()
 			}
@@ -804,12 +876,19 @@ func Decompress(src []byte) ([]byte, error) {
 			if pos+12 > len(src) {
 				return nil, errors.New("lzfse: LZVN block header truncated")
 			}
-			nRawBytes := int(binary.LittleEndian.Uint32(src[pos+4:]))
-			nPayloadBytes := int(binary.LittleEndian.Uint32(src[pos+8:]))
+			raw := uint64(binary.LittleEndian.Uint32(src[pos+4:]))
+			payload := uint64(binary.LittleEndian.Uint32(src[pos+8:]))
 			pos += 12
-			if pos+nPayloadBytes > len(src) {
+			if !avail(payload) {
 				return nil, errors.New("lzfse: LZVN block payload truncated")
 			}
+			if raw > lzvnMaxExpansion*payload {
+				return nil, errors.New("lzfse: LZVN block declares more raw bytes than its payload can encode")
+			}
+			if !fits(raw) {
+				return nil, ErrTooLarge
+			}
+			nRawBytes, nPayloadBytes := int(raw), int(payload)
 			block := make([]byte, nRawBytes)
 			n, err := lzvnDecode(block, src[pos:pos+nPayloadBytes])
 			if err != nil {
